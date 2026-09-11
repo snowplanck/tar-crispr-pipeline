@@ -67,8 +67,11 @@ def run(
     if not force_fallback:
         config = check_external_tools(config)
     else:
+        # --no-blast forces the k-mer fallback for sgRNA specificity only.
+        # It must NOT disable RNAfold, which is used for secondary structure
+        # prediction in primer/arm design and is independent of BLAST.
+        config = check_external_tools(config)
         config.blast_available = False
-        config.rnafold_available = False
 
     _log(f"Starting TAR-CRISPR pipeline...", verbose)
     _log(f"BLAST available: {config.blast_available}", verbose)
