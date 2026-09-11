@@ -230,15 +230,56 @@ def _check_specificity_fallback(protospacer: str, genome_seq: str,
 
 
 def _hamming_search(haystack: str, needle: str, max_mismatch: int) -> int:
-    """Count windows in *haystack* within *max_mismatch* of *needle*."""
-    count = 0
+    """Count windows in *haystack* within *max_mismatch* of *needle*.
+
+    Strategy: split the needle into ``max_mismatch + 1`` contiguous blocks.
+    By the pigeonhole principle, any window with at most ``max_mismatch``
+    mismatches must match at least one block exactly. We locate each block
+    with ``str.find`` (C speed), collect candidate windows, then verify each
+    with an early-exit Hamming check.
+
+    This is exact — no window within tolerance is missed.
+    """
     nlen = len(needle)
-    for i in range(len(haystack) - nlen + 1):
-        window = haystack[i:i + nlen]
-        mism = sum(1 for a, b in zip(window, needle) if a != b)
-        if mism <= max_mismatch:
-            count += 1
+    hlen = len(haystack)
+    if nlen == 0 or hlen < nlen:
+        return 0
+
+    n_blocks = max_mismatch + 1
+    if n_blocks > nlen:
+        n_blocks = nlen
+    block_len = max(1, nlen // n_blocks)
+
+    count = 0
+    seen: set = set()
+
+    for b in range(n_blocks):
+        bstart = b * block_len
+        bend = nlen if b == n_blocks - 1 else bstart + block_len
+        block = needle[bstart:bend]
+        if not block:
+            continue
+        start = 0
+        while True:
+            idx = haystack.find(block, start)
+            if idx == -1:
+                break
+            win_start = idx - bstart
+            # Window must be fully inside haystack
+            if 0 <= win_start and win_start + nlen <= hlen and win_start not in seen:
+                seen.add(win_start)
+                mism = 0
+                for a, c in zip(haystack[win_start:win_start + nlen], needle):
+                    if a != c:
+                        mism += 1
+                        if mism > max_mismatch:
+                            break
+                if mism <= max_mismatch:
+                    count += 1
+            start = idx + 1
+
     return count
+
 
 
 def rank_sgRNAs(candidates: list[PAMCandidate],
