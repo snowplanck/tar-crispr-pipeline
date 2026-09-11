@@ -32,6 +32,12 @@ class ClusterInfo:
     name: str = "BGC"
     description: str = ""
     strand: str = "+"
+    gc_percent: Optional[float] = None
+
+    @property
+    def length(self) -> int:
+        """Length of the cluster in bp (end - start)."""
+        return self.end - self.start
 
 @dataclass
 class PAMCandidate:
