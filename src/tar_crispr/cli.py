@@ -95,8 +95,24 @@ def run(
     _log(f"BGC: {bgc_stats['length']} bp, GC={bgc_stats['gc_percent']}%", verbose)
     _log(f"Vector: {vector_stats['length']} bp, GC={vector_stats['gc_percent']}%", verbose)
 
-    # Determine cluster bounds
-    cluster = extract_cluster_bounds(bgc_record, start, end)
+    # Determine cluster bounds.
+    # If the user gave a FASTA --bgc (no features) and omitted --start/--end,
+    # extract_cluster_bounds cannot infer anything. Fail early with a clear
+    # message instead of raising a ValueError deep in the call stack.
+    has_features = bool(getattr(bgc_record, "features", None))
+    if (start is None or end is None) and not has_features and genbank is None:
+        sys.exit(
+            "ERROR: Cannot determine cluster bounds.\n"
+            "  - You provided --bgc as a FASTA without --start/--end, and the file\n"
+            "    has no features to parse coordinates from.\n"
+            "  - Either pass --start and --end (0-based, half-open), or use\n"
+            "    --genbank with an annotated file."
+        )
+
+    try:
+        cluster = extract_cluster_bounds(bgc_record, start, end)
+    except ValueError as e:
+        sys.exit(f"ERROR: Could not determine cluster bounds: {e}")
     _log(f"Cluster: {cluster.name}, start={cluster.start}, end={cluster.end}", verbose)
 
     # Get flanking sequences
