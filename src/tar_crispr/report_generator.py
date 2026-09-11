@@ -50,17 +50,22 @@ def _format_arm_table(arms: dict) -> str:
 def _format_primer_table(primers: dict) -> str:
     """Format tailed primers into a Markdown table."""
     lines = [
-        "| Name | Sequence | Tail Len | Anneal Len | Tm (°C) | GC% | Hairpin | Dimer | Valid | Issues |",
-        "|------|----------|----------|------------|---------|-----|---------|-------|-------|--------|",
+        "| Name | Sequence | Tail Len | Anneal Len | Tm (°C) | GC% | "
+        "Hairpin | Self-Dimer | Cross-Dimer | Valid | Issues | Warnings |",
+        "|------|----------|----------|------------|---------|-----|"
+        "---------|------------|-------------|-------|--------|----------|",
     ]
     for key in ("left", "right"):
         p = primers[key]
-        issues_str = "; ".join(p.issues) if p.issues else "None"
+        issues_str = "; ".join(p.issues) if p.issues else "—"
+        warnings_str = "; ".join(getattr(p, "warnings", []) or []) or "—"
         lines.append(
             f"| {p.name} | `{p.sequence}` | {len(p.tail)} | "
             f"{len(p.annealing_region)} | "
             f"{p.tm} | {p.gc_percent} | {'Yes' if p.hairpin else 'No'} | "
-            f"{'Yes' if p.dimer else 'No'} | {'Yes' if p.valid else 'No'} | {issues_str} |"
+            f"{'Yes' if p.self_dimer else 'No'} | "
+            f"{'Yes' if p.cross_dimer else 'No'} | "
+            f"{'Yes' if p.valid else 'No'} | {issues_str} | {warnings_str} |"
         )
     return "\n".join(lines)
 

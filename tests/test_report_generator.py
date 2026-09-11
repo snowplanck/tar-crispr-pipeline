@@ -63,13 +63,13 @@ class TestFormatTables:
         left_p = TailedPrimer(
             name="FORWARD_left", sequence="GCGCGCGCATATATATATACGTACGT",
             tail="GCGCGCGCATATATATAT", annealing_region="GTACGT",
-            tm=60.0, gc_percent=50.0, hairpin=False, dimer=False,
+            tm=60.0, gc_percent=50.0, hairpin=False, self_dimer=False, cross_dimer=False,
             issues=[], valid=True,
         )
         right_p = TailedPrimer(
             name="REVERSE_right", sequence="TATATATACGCGCGCGCGCGTACGT",
             tail="TATATATACGCGCGCGCGCG", annealing_region="GTACGT",
-            tm=60.0, gc_percent=50.0, hairpin=False, dimer=False,
+            tm=60.0, gc_percent=50.0, hairpin=False, self_dimer=False, cross_dimer=False,
             issues=[], valid=True,
         )
         primers = {"left": left_p, "right": right_p}
@@ -114,13 +114,13 @@ class TestGenerateReport:
         left_p = TailedPrimer(
             name="FORWARD_left", sequence="GCGCGCGCATATATATATACGT",
             tail="GCGCGCGCATATATATAT", annealing_region="ACGT",
-            tm=60.0, gc_percent=50.0, hairpin=False, dimer=False,
+            tm=60.0, gc_percent=50.0, hairpin=False, self_dimer=False, cross_dimer=False,
             issues=[], valid=True,
         )
         right_p = TailedPrimer(
             name="REVERSE_right", sequence="TATATATACGCGCGCGCGCGT",
             tail="TATATATACGCGCGCGCGCG", annealing_region="GT",
-            tm=60.0, gc_percent=50.0, hairpin=False, dimer=False,
+            tm=60.0, gc_percent=50.0, hairpin=False, self_dimer=False, cross_dimer=False,
             issues=[], valid=True,
         )
         primers = {"left": left_p, "right": right_p}
@@ -166,13 +166,13 @@ class TestGenerateReport:
         left_p = TailedPrimer(
             name="FORWARD_left", sequence="ACGTACGTACGTACGTACGT",
             tail="ACGTACGTACGTACGT", annealing_region="ACGT",
-            tm=60.0, gc_percent=50.0, hairpin=False, dimer=False,
+            tm=60.0, gc_percent=50.0, hairpin=False, self_dimer=False, cross_dimer=False,
             issues=[], valid=True,
         )
         right_p = TailedPrimer(
             name="REVERSE_right", sequence="ACGTACGTACGTACGTACGT",
             tail="ACGTACGTACGTACGT", annealing_region="ACGT",
-            tm=60.0, gc_percent=50.0, hairpin=False, dimer=False,
+            tm=60.0, gc_percent=50.0, hairpin=False, self_dimer=False, cross_dimer=False,
             issues=[], valid=True,
         )
         primers = {"left": left_p, "right": right_p}

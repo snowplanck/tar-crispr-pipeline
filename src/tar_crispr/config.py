@@ -64,8 +64,10 @@ class TailedPrimer:
     tm: float
     gc_percent: float
     hairpin: bool
-    dimer: bool
+    self_dimer: bool = False
+    cross_dimer: bool = False
     issues: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
     valid: bool = True
 
 @dataclass

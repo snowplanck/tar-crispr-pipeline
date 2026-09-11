@@ -104,13 +104,13 @@ class TestOptimizeAnnealingLength:
     def test_finds_in_range(self):
         # Vector sequence with known Tm characteristics
         vec = "GCGCGCGCATATATATATACGTACGTACGTACGTACGTACGTACGTACGTACGT"
-        best = _optimize_annealing_length(vec, 10, 30, 18, 25, 58, 62)
+        best = _optimize_annealing_length(vec, 30, 18, 25, 58, 62)
         assert 18 <= len(best) <= 25
         assert len(best) > 0
 
     def test_fallback(self):
         vec = "A" * 100
-        best = _optimize_annealing_length(vec, 10, 30, 18, 25, 58, 62)
+        best = _optimize_annealing_length(vec, 30, 18, 25, 58, 62)
         assert best is not None
         assert len(best) > 0
 
