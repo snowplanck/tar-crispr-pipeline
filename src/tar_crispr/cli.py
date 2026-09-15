@@ -37,6 +37,14 @@ def run(
     genbank: Optional[str] = typer.Option(None, "--genbank", help="GenBank file with annotations"),
     start: Optional[int] = typer.Option(None, "--start", help="BGC start coordinate (0-based)"),
     end: Optional[int] = typer.Option(None, "--end", help="BGC end coordinate (0-based)"),
+    gene_kinds: Optional[List[str]] = typer.Option(
+        None, "--gene-kinds",
+        help=(
+            "Filter antiSMASH region bounds by gene_kind "
+            "(e.g. biosynthetic,biosynthetic-additional). "
+            "Pass 'all' to use the region span as-is."
+        ),
+    ),
     vector_cut_left: int = typer.Option(None, "--vector-cut-left", help="Vector left linearization coordinate (0-based)"),
     vector_cut_right: Optional[int] = typer.Option(None, "--vector-cut-right", help="Vector right linearization coordinate (0-based)"),
     vector_enzyme: str = typer.Option("EcoRI", "--vector-enzyme", help="Restriction enzyme for vector linearization (when cut coords not specified)"),
@@ -110,7 +118,7 @@ def run(
         )
 
     try:
-        cluster = extract_cluster_bounds(bgc_record, start, end)
+        cluster = extract_cluster_bounds(bgc_record, start, end, gene_kinds=gene_kinds)
     except ValueError as e:
         sys.exit(f"ERROR: Could not determine cluster bounds: {e}")
     _log(f"Cluster: {cluster.name}, start={cluster.start}, end={cluster.end}", verbose)

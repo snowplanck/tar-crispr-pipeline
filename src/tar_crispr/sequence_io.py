@@ -85,20 +85,34 @@ def validate_sequence(seq: SeqRecord) -> dict:
 
 def extract_cluster_bounds(seqrecord: SeqRecord,
                            start: Optional[int] = None,
-                           end: Optional[int] = None) -> ClusterInfo:
+                           end: Optional[int] = None,
+                           gene_kinds: Optional[list[str]] = None) -> ClusterInfo:
     """Identify cluster start/end coordinates.
 
-    If start and end are provided, use them directly. Otherwise, parse from
-    GenBank features (looks for 'cluster' feature type or 'CDS' span).
+    Resolution order:
+
+    1. If ``start`` and ``end`` are given, use them directly.
+    2. If the record has an antiSMASH ``region`` feature, use it:
+
+       - with ``gene_kinds`` set (e.g. ``["biosynthetic",
+         "biosynthetic-additional"]``), the bounds are computed from the
+         span of the CDS inside the region whose ``gene_kind`` qualifier
+         is in the list;
+       - with ``gene_kinds`` unset or ``["all"]``, the bounds are the
+         start/end of the region feature itself.
+    3. Otherwise, look for a generic ``cluster`` feature.
+    4. Otherwise, use the span of all ``CDS`` features.
 
     Parameters
     ----------
     seqrecord : SeqRecord
-        The full genomic sequence record.
-    start : int, optional
-        1-based start coordinate of the BGC.
-    end : int, optional
-        1-based end coordinate of the BGC.
+        The genomic sequence record (from FASTA or GenBank).
+    start, end : int, optional
+        Explicit 0-based half-open coordinates. Take precedence over
+        any annotation.
+    gene_kinds : list of str, optional
+        Restrict antiSMASH region bounds to CDS matching these
+        ``gene_kind`` values. Use ``["all"]`` to force the region span.
 
     Returns
     -------
@@ -108,15 +122,20 @@ def extract_cluster_bounds(seqrecord: SeqRecord,
     if start is not None and end is not None:
         return ClusterInfo(start=start, end=end)
 
-    # Try parsing GenBank features
+    # Try antiSMASH region first
     if seqrecord.features:
-        # Look for 'cluster' feature
+        region = _find_antismash_region(seqrecord)
+        if region is not None:
+            return _bounds_from_antismash_region(region, seqrecord, gene_kinds)
+
+        # Generic 'cluster' feature
         for f in seqrecord.features:
             if f.type.lower() == "cluster":
                 s = int(f.location.start)
                 e = int(f.location.end)
                 return ClusterInfo(start=s, end=e,
                                    name=f.qualifiers.get("label", ["BGC"])[0])
+
         # Fallback: use CDS span
         cds = [f for f in seqrecord.features if f.type.lower() == "cds"]
         if cds:
@@ -128,6 +147,80 @@ def extract_cluster_bounds(seqrecord: SeqRecord,
         "Cluster bounds not provided and could not be parsed from GenBank features. "
         "Please provide --start and --end."
     )
+
+
+def _find_antismash_region(seqrecord: SeqRecord):
+    """Return the first antiSMASH 'region' feature, or None."""
+    for f in seqrecord.features:
+        if f.type.lower() == "region":
+            return f
+    return None
+
+
+def _bounds_from_antismash_region(region, seqrecord: SeqRecord,
+                                  gene_kinds: Optional[list[str]]) -> ClusterInfo:
+    """Compute cluster bounds from an antiSMASH region feature.
+
+    If ``gene_kinds`` is None, empty, or contains only "all", the region
+    span is used directly. Otherwise the CDS inside the region are
+    filtered by their ``gene_kind`` qualifier, and the bounds are the
+    min(start) / max(end) of the filtered CDS.
+    """
+    region_start = int(region.location.start)
+    region_end = int(region.location.end)
+    region_number = region.qualifiers.get("region_number", ["?"])[0]
+    product = region.qualifiers.get("product", [""])[0]
+    name = f"antiSMASH_region_{region_number}"
+    description = product
+
+    kinds = None
+    if gene_kinds:
+        normalized = [k.strip().lower() for k in gene_kinds if k.strip()]
+        if normalized and normalized != ["all"]:
+            kinds = set(normalized)
+
+    if kinds is None:
+        return ClusterInfo(
+            start=region_start, end=region_end,
+            name=name, description=description,
+        )
+
+    # Filter CDS inside the region by gene_kind
+    selected = []
+    for f in seqrecord.features:
+        if f.type.lower() != "cds":
+            continue
+        s = int(f.location.start)
+        e = int(f.location.end)
+        if s < region_start or e > region_end:
+            continue
+        kind = f.qualifiers.get("gene_kind", [""])[0].lower()
+        if kind in kinds:
+            selected.append((s, e))
+
+    if not selected:
+        raise ValueError(
+            f"No CDS inside antiSMASH region with gene_kind in {sorted(kinds)}. "
+            f"Available kinds: {_available_gene_kinds(seqrecord)}"
+        )
+
+    s = min(c[0] for c in selected)
+    e = max(c[1] for c in selected)
+    return ClusterInfo(
+        start=s, end=e, name=name,
+        description=f"{description} (filtered by {sorted(kinds)})",
+    )
+
+
+def _available_gene_kinds(seqrecord: SeqRecord) -> list[str]:
+    """Return the sorted list of gene_kind values present on CDS features."""
+    kinds = set()
+    for f in seqrecord.features:
+        if f.type.lower() != "cds":
+            continue
+        for k in f.qualifiers.get("gene_kind", []):
+            kinds.add(k.lower())
+    return sorted(kinds)
 
 
 def get_flanking_sequence(full_seq: SeqRecord, cluster: ClusterInfo,
