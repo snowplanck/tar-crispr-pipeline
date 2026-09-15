@@ -50,3 +50,8 @@ results/
 .env
 .env.*
 !.env.example
+
+# Streamlit GUI runtime artifacts
+tar_crispr_gui_*/
+__pycache__/
+*.pyc
