@@ -175,7 +175,12 @@ def _bounds_from_antismash_region(region, seqrecord: SeqRecord,
 
     kinds = None
     if gene_kinds:
-        normalized = [k.strip().lower() for k in gene_kinds if k.strip()]
+        # Accept both "--gene-kinds a,b" (single string with commas) and
+        # "--gene-kinds a --gene-kinds b" (list of strings).
+        flat: list[str] = []
+        for k in gene_kinds:
+            flat.extend(k.split(","))
+        normalized = [x.strip().lower() for x in flat if x.strip()]
         if normalized and normalized != ["all"]:
             kinds = set(normalized)
 
