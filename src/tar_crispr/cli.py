@@ -146,6 +146,31 @@ def run(
     )
     _log(f"Found {len(sgRNAs['left'])} left, {len(sgRNAs['right'])} right candidates", verbose)
 
+    # Fail early if either side has no sgRNA. Without cuts at both
+    # boundaries, the fragment cannot be excised and downstream steps
+    # would hit an AttributeError on NoneType.
+    missing = [side for side in ("left", "right") if not sgRNAs[side]]
+    if missing:
+        sides = " and ".join(missing)
+        hint = ""
+        if any(s in missing for s in ("left",)) and cluster.start == 0:
+            hint = (
+                "\n  Hint: the cluster touches the start of the genome "
+                "(start=0), so there is no upstream flank to search for "
+                "PAM sites. Trim the cluster or provide a genome with "
+                "extra upstream sequence."
+            )
+        if any(s in missing for s in ("right",)) and cluster.end >= len(str(genome_record.seq)):
+            hint += (
+                "\n  Hint: the cluster touches the end of the genome "
+                "(end=genome_length), so there is no downstream flank. "
+                "Trim the cluster or extend the genome."
+            )
+        sys.exit(
+            f"ERROR: No sgRNA candidates found at the {sides} boundary. "
+            f"Cannot excise a fragment.{hint}"
+        )
+
     # Select sgRNAs
     if auto_select and sgRNAs["left"] and sgRNAs["right"]:
         selected = {"left": sgRNAs["left"][0], "right": sgRNAs["right"][0]}
