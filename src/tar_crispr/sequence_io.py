@@ -39,6 +39,119 @@ def read_sequence(path: str) -> SeqRecord:
     return rec
 
 
+def read_genome(path: str, sep_len: int = 60
+                ) -> tuple[SeqRecord, dict[str, tuple[int, int]]]:
+    """Read a (possibly multi-record) genome file.
+
+    Returns a single flattened SeqRecord that concatenates every record in
+    the file, separated by ``sep_len`` Ns, plus a map from scaffold ID to
+    the (start, end) half-open interval it occupies in the flat sequence.
+
+    The N separator prevents 20 nt sgRNAs (or 50-60 bp homology arms) from
+    spuriously matching across scaffold boundaries when the flat genome is
+    scanned for specificity or uniqueness.
+
+    Parameters
+    ----------
+    path : str
+        Path to a FASTA or GenBank file (single- or multi-record).
+    sep_len : int
+        Length of the N separator inserted between records (default 60).
+
+    Returns
+    -------
+    flat : SeqRecord
+        Concatenated genome with separators, id="flattened_genome".
+    offsets : dict
+        Mapping ``scaffold_id -> (start, end)`` in the flat sequence.
+    """
+    fmt = _detect_format(path)
+    records = list(SeqIO.parse(path, fmt))
+    if not records:
+        raise ValueError(f"No sequences found in {path}")
+
+    sep = "N" * sep_len
+    parts: list[str] = []
+    offsets: dict[str, tuple[int, int]] = {}
+    cursor = 0
+
+    for i, rec in enumerate(records):
+        sid = rec.id or f"record_{i}"
+        # Handle duplicate IDs by appending a suffix
+        if sid in offsets:
+            sid = f"{sid}_{i}"
+        seq_str = str(rec.seq).upper()
+        seq_len = len(seq_str)
+        offsets[sid] = (cursor, cursor + seq_len)
+        parts.append(seq_str)
+        cursor += seq_len
+        # Do NOT add separator after the last record
+        if i < len(records) - 1:
+            parts.append(sep)
+            cursor += sep_len
+
+    flat_seq = "".join(parts)
+    flat_rec = SeqRecord(
+        Seq(flat_seq),
+        id="flattened_genome",
+        description=f"{len(records)} scaffolds; separator={sep_len}N",
+        annotations={"molecule_type": "DNA"},
+    )
+    return flat_rec, offsets
+
+
+def translate_to_flat(scaffold_id: str, local_start: int, local_end: int,
+                      offsets: dict[str, tuple[int, int]]) -> tuple[int, int]:
+    """Translate (start, end) relative to a scaffold into coordinates in
+    the flattened genome.
+
+    Parameters
+    ----------
+    scaffold_id : str
+        Scaffold identifier as stored in *offsets*.
+    local_start, local_end : int
+        Half-open coordinates relative to the scaffold.
+    offsets : dict
+        Map returned by :func:`read_genome`.
+
+    Returns
+    -------
+    tuple of (flat_start, flat_end)
+    """
+    if scaffold_id not in offsets:
+        raise KeyError(
+            f"Scaffold {scaffold_id!r} not found in genome. "
+            f"Available: {sorted(offsets)}"
+        )
+    base, _ = offsets[scaffold_id]
+    return base + local_start, base + local_end
+
+
+def translate_from_flat(flat_start: int, flat_end: int,
+                        offsets: dict[str, tuple[int, int]]
+                        ) -> tuple[str, int, int]:
+    """Map a coordinate in the flattened genome back to (scaffold, local_start, local_end).
+
+    Parameters
+    ----------
+    flat_start, flat_end : int
+        Half-open coordinates in the flattened genome.
+    offsets : dict
+        Map returned by :func:`read_genome`.
+
+    Returns
+    -------
+    (scaffold_id, local_start, local_end)
+    """
+    for sid, (s, e) in offsets.items():
+        if s <= flat_start and flat_end <= e:
+            return sid, flat_start - s, flat_end - s
+    raise ValueError(
+        f"Coordinates {flat_start}..{flat_end} span a separator or fall "
+        f"outside every scaffold."
+    )
+
+
 def _detect_format(path: str) -> str:
     """Detect file format from extension or content."""
     ext = os.path.splitext(path)[1].lower()
