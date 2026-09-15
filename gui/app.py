@@ -102,6 +102,17 @@ with p3:
             "KpnI", "NheI", "ClaI", "EcoRI", "BamHI", "HindIII",
         ],
     )
+
+gene_kinds_raw = st.text_input(
+    "antiSMASH gene_kinds filter (optional)",
+    value="",
+    help=(
+        "Comma-separated list of gene_kind values to restrict the "
+        "antiSMASH region to. Examples: 'biosynthetic,biosynthetic-additional' "
+        "(core), or add 'regulatory,transport' for the full functional cluster. "
+        "Leave empty to use the region as-is."
+    ),
+)
 with p4:
     use_blast = st.checkbox(
         "Use BLAST for specificity", value=False,
@@ -152,11 +163,16 @@ if run_button:
         progress_bar.progress(min(max(frac, 0.0), 1.0), text=msg)
         status.write(msg)
 
+    gene_kinds = None
+    if gene_kinds_raw and gene_kinds_raw.strip():
+        gene_kinds = [k.strip() for k in gene_kinds_raw.split(",") if k.strip()]
+
     kwargs = dict(
         bgc_path=bgc_path,
         genome_path=genome_path,
         vector_path=vector_path,
         output_dir=output_dir,
+        gene_kinds=gene_kinds,
         vector_enzyme=None if enzyme == "(none)" else enzyme,
         use_blast=use_blast,
         pam_window=int(pam_window),
@@ -261,7 +277,7 @@ if result is not None:
             "issues": "; ".join(p.issues) if p.issues else "",
             "warnings": "; ".join(getattr(p, "warnings", []) or []),
         })
-    st.dataframe(rows, use_container_width=True)
+    st.dataframe(rows, width='stretch')
 
     # Report markdown
     st.subheader("Full report")
@@ -272,4 +288,4 @@ if result is not None:
     # SVG inline
     svg_text = result["cluster_map_svg"].read_text(encoding="utf-8")
     st.subheader("Cluster map")
-    st.components.v1.html(svg_text, height=250, scrolling=True)
+    st.markdown(svg_text, unsafe_allow_html=True)

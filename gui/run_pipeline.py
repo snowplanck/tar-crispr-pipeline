@@ -38,6 +38,7 @@ def run_pipeline(
     output_dir: str | Path,
     start: Optional[int] = None,
     end: Optional[int] = None,
+    gene_kinds: Optional[list[str]] = None,
     vector_enzyme: Optional[str] = None,
     use_blast: bool = False,
     pam_window: int = 500,
@@ -103,11 +104,14 @@ def run_pipeline(
             "Cannot determine cluster bounds: the BGC file has no annotated "
             "features and --start/--end were not provided."
         )
+    # When explicit start/end are given, we don't need features; pass them
+    # straight through. Otherwise rely on the BGC annotations (antiSMASH
+    # region, generic cluster, or CDS span), optionally filtered by
+    # gene_kinds.
     cluster = extract_cluster_bounds(
-        genome_record if has_features is False else bgc_record,
+        bgc_record if has_features else genome_record,
         start, end,
-    ) if (start is not None and end is not None) else extract_cluster_bounds(
-        genome_record, start, end
+        gene_kinds=gene_kinds,
     )
 
     # --- Step 3: flanks ---
