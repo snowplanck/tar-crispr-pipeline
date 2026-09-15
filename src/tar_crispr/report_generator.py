@@ -133,8 +133,8 @@ def generate_svg_cluster_map(cluster_seq: str,
     elements.append(f'<rect x="0" y="{bar_y}" width="{arm_l_w}" '
                      f'height="{bar_height}" fill="#4CAF50" fill-opacity="0.3" '
                      f'stroke="#4CAF50" stroke-width="1"/>')
-    elements.append(f'<text x="{scale_x(left_arm.length/2)}" y="{bar_y - 5}" '
-                     f'font-size="12" text-anchor="middle" fill="#333">'
+    elements.append(f'<text x="5" y="{bar_y - 5}" '
+                     f'font-size="12" text-anchor="start" fill="#333">'
                      f'Left Arm ({left_arm.length}bp)</text>')
 
     # Right homology arm
@@ -143,8 +143,8 @@ def generate_svg_cluster_map(cluster_seq: str,
     elements.append(f'<rect x="{arm_r_x}" y="{bar_y}" width="{arm_r_w}" '
                      f'height="{bar_height}" fill="#2196F3" fill-opacity="0.3" '
                      f'stroke="#2196F3" stroke-width="1"/>')
-    elements.append(f'<text x="{scale_x(arm_right_start + right_arm.length/2)}" '
-                     f'y="{bar_y - 5}" font-size="12" text-anchor="middle" '
+    elements.append(f'<text x="{width - 5}" '
+                     f'y="{bar_y - 5}" font-size="12" text-anchor="end" '
                      f'fill="#333">Right Arm ({right_arm.length}bp)</text>')
 
     # Cas9 cut site markers
