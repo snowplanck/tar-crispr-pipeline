@@ -12,7 +12,8 @@ import typer
 
 from tar_crispr.config import PipelineConfig, ClusterInfo, PAMCandidate, HomologyArm
 from tar_crispr.sequence_io import (
-    read_sequence, validate_sequence, extract_cluster_bounds,
+    read_sequence, read_genome, locate_bgc_in_genome, translate_to_flat,
+    validate_sequence, extract_cluster_bounds,
     get_flanking_sequence, check_external_tools,
 )
 from tar_crispr.pam_finder import design_sgRNAs, find_pam_sites, rank_sgRNAs
@@ -89,7 +90,14 @@ def run(
     _log("Step 1: Reading input sequences...", verbose)
     bgc_record = read_sequence(genbank if genbank else bgc)
     vector_record = read_sequence(vector)
-    genome_record = read_sequence(genome) if genome else None
+
+    genome_record = None
+    genome_offsets = None
+    if genome:
+        genome_record, genome_offsets = read_genome(genome)
+        if len(genome_offsets) > 1:
+            _log(f"Genome: {len(genome_offsets)} scaffolds, "
+                f"{len(genome_record.seq)} bp flattened (60N separators)", verbose)
 
     bgc_stats = validate_sequence(bgc_record)
     vector_stats = validate_sequence(vector_record)
@@ -108,17 +116,48 @@ def run(
     # extract_cluster_bounds cannot infer anything. Fail early with a clear
     # message instead of raising a ValueError deep in the call stack.
     has_features = bool(getattr(bgc_record, "features", None))
+
+    # If the user has a genome AND an isolated BGC record (the common case:
+    # a BGC exported from antiSMASH, plus the genome it came from) but did
+    # not say where in the genome it is, locate it automatically via BLAST
+    # instead of requiring --start/--end or annotated features.
+    if start is None and end is None and genome_record is not None and not has_features:
+        _log("No --start/--end given; locating BGC in genome via BLAST...", verbose)
+        try:
+            scaffold_id, local_start, local_end, identity, locate_warnings = \
+                locate_bgc_in_genome(bgc_record, genome_record, genome_offsets)
+        except ValueError as e:
+            sys.exit(
+                f"ERROR: Could not locate the BGC in the given genome: {e}\n"
+                "  - Pass --start/--end manually, or use --genbank with an "
+                "annotated file."
+            )
+        for w in locate_warnings:
+            _log(f"WARNING: {w}", verbose)
+        _log(f"BGC located: {scaffold_id}, identity={identity:.1f}%", verbose)
+        start, end = translate_to_flat(scaffold_id, local_start, local_end,
+                                       genome_offsets)
+        cluster_target = genome_record  # coordinates are now in the flat genome
+    else:
+        # Unchanged from the original behavior: start/end (explicit or from
+        # --genbank features) are always relative to bgc_record, never to
+        # genome_record — genome_record has no features of its own, and by
+        # convention the caller's --start/--end already match the same
+        # coordinate space bgc_record was extracted from.
+        cluster_target = bgc_record
+
     if (start is None or end is None) and not has_features and genbank is None:
         sys.exit(
             "ERROR: Cannot determine cluster bounds.\n"
             "  - You provided --bgc as a FASTA without --start/--end, and the file\n"
             "    has no features to parse coordinates from.\n"
             "  - Either pass --start and --end (0-based, half-open), or use\n"
-            "    --genbank with an annotated file."
+            "    --genbank with an annotated file, or provide --genome so the\n"
+            "    BGC can be located automatically via BLAST."
         )
 
     try:
-        cluster = extract_cluster_bounds(bgc_record, start, end, gene_kinds=gene_kinds)
+        cluster = extract_cluster_bounds(cluster_target, start, end, gene_kinds=gene_kinds)
     except ValueError as e:
         sys.exit(f"ERROR: Could not determine cluster bounds: {e}")
     _log(f"Cluster: {cluster.name}, start={cluster.start}, end={cluster.end}", verbose)

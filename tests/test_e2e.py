@@ -1,10 +1,14 @@
 """End-to-end test: run the full CLI on synthetic data and verify outputs."""
 import os
+import random
 import sys
 import subprocess
 from pathlib import Path
 
 import pytest
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 
 
 @pytest.fixture
@@ -148,3 +152,76 @@ class TestEndToEnd:
         assert "Left (5')" in report
         assert "Right (3')" in report
         assert "homology arm" in report.lower()
+
+
+class TestAutoLocateBgcInGenome:
+    """End-to-end test for Phase 2: locating an isolated BGC inside a
+    multi-scaffold genome via BLAST, with no --start/--end given."""
+
+    def test_pipeline_auto_locates_bgc_across_scaffolds(self, tmp_path, project_root):
+        random.seed(123)
+        bgc_seq = "".join(random.choices("ACGT", k=1500))
+        flank = 400
+
+        scaffolds = []
+        for i in range(5):
+            if i == 2:
+                filler = "".join(random.choices("ACGT", k=flank))
+                seq = filler + bgc_seq + filler
+                sid = "scaf2_with_bgc"
+            else:
+                seq = "".join(random.choices("ACGT", k=flank * 3))
+                sid = f"scaf{i}"
+            scaffolds.append(SeqRecord(Seq(seq), id=sid, description=""))
+
+        genome_path = tmp_path / "multiscaffold_genome.fasta"
+        with open(genome_path, "w") as fh:
+            SeqIO.write(scaffolds, fh, "fasta")
+
+        bgc_path = tmp_path / "isolated_bgc.fasta"
+        with open(bgc_path, "w") as fh:
+            SeqIO.write(SeqRecord(Seq(bgc_seq), id="isolated_bgc", description=""),
+                       fh, "fasta")
+
+        vector = str(project_root / "test_data" / "synthetic_vector.fasta")
+        output = str(tmp_path / "e2e_autolocate_output")
+
+        cmd = [
+            sys.executable, "-m", "tar_crispr.cli", "run",
+            "--bgc", str(bgc_path),
+            "--vector", vector,
+            "--genome", str(genome_path),
+            "--output", output,
+            "--no-blast",
+            "--verbose",
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, f"Pipeline failed: {result.stderr}"
+
+        combined_log = result.stdout + result.stderr
+        assert "locating BGC in genome via BLAST" in combined_log
+        assert "BGC located: scaf2_with_bgc" in combined_log
+        assert "identity=100.0%" in combined_log
+
+        report_md = Path(output) / "report.md"
+        assert report_md.exists()
+
+    def test_pipeline_fails_clearly_without_genome_or_coords(self, tmp_path, project_root):
+        """No --genome, no --start/--end, no annotated features: should
+        fail with the existing clear error, not a traceback."""
+        bgc = str(project_root / "test_data" / "synthetic_bgc.fasta")
+        vector = str(project_root / "test_data" / "synthetic_vector.fasta")
+        output = str(tmp_path / "e2e_no_coords_output")
+
+        cmd = [
+            sys.executable, "-m", "tar_crispr.cli", "run",
+            "--bgc", bgc,
+            "--vector", vector,
+            "--output", output,
+            "--no-blast",
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        assert result.returncode != 0
+        assert "Cannot determine cluster bounds" in (result.stdout + result.stderr)

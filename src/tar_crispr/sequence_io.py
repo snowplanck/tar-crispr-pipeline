@@ -1,7 +1,9 @@
 """Step 1: Ingestion, validation, and cluster coordinate extraction."""
+import glob
 import os
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
@@ -366,6 +368,138 @@ def get_flanking_sequence(full_seq: SeqRecord, cluster: ClusterInfo,
     downstream_end = min(len(seq_str), cluster.end + window)
     downstream = seq_str[cluster.end:downstream_end]
     return upstream, cluster_seq, downstream
+
+
+def locate_bgc_in_genome(bgc_record: SeqRecord,
+                         flat_record: SeqRecord,
+                         offsets: dict[str, tuple[int, int]],
+                         evalue: float = 1e-10,
+                         min_identity: float = 95.0,
+                         min_coverage: float = 90.0,
+                         ) -> tuple[str, int, int, float, list[str]]:
+    """Locate *bgc_record* inside the flattened genome via BLAST.
+
+    Used when the user supplies a genome (single- or multi-scaffold) and a
+    BGC record but no explicit --start/--end: this finds where the BGC
+    lives in the genome automatically, the same way we did manually with
+    blastn + makeblastdb against scaffold2.fasta for the colinomycin case.
+
+    Only ONE blastn database is built (against the whole flat genome),
+    reused for the single query — this is cheap regardless of genome size,
+    unlike the earlier per-candidate specificity bug.
+
+    Returns
+    -------
+    (scaffold_id, local_start, local_end, identity_pct, warnings)
+        Coordinates are 0-based, half-open, relative to the ORIGINAL
+        scaffold (already translated back via translate_from_flat) — ready
+        to pass straight into extract_cluster_bounds.
+
+    Raises
+    ------
+    ValueError
+        If no hit clears min_identity/min_coverage, or every hit spans a
+        scaffold separator (spurious cross-scaffold alignment).
+    """
+    warnings: list[str] = []
+    bgc_seq = str(bgc_record.seq).upper()
+    bgc_len = len(bgc_seq)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".fasta", delete=False) as qfh, \
+         tempfile.NamedTemporaryFile(mode="w", suffix=".fasta", delete=False) as dfh:
+        qfh.write(f">query\n{bgc_seq}\n")
+        qpath = qfh.name
+        dfh.write(f">{flat_record.id}\n{str(flat_record.seq).upper()}\n")
+        dpath = dfh.name
+
+    db_dir = os.path.dirname(dpath)
+    db_name = os.path.splitext(os.path.basename(dpath))[0]
+    full_db = os.path.join(db_dir, db_name)
+
+    try:
+        subprocess.run(
+            ["makeblastdb", "-in", dpath, "-dbtype", "nucl", "-out", full_db],
+            check=True, capture_output=True, timeout=120,
+        )
+        result = subprocess.run(
+            ["blastn", "-query", qpath, "-db", full_db,
+             "-evalue", str(evalue), "-max_hsps", "10", "-dust", "no",
+             "-outfmt", "6 sseqid pident length qlen sstart send bitscore"],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    finally:
+        # BLAST+ database file extensions vary by version (v4 vs v5 index
+        # format: .nhr/.nin/.nsq vs .ndb/.njs/.not/.ntf/.nto/...). Glob for
+        # anything matching the db prefix instead of a fixed extension list,
+        # so this doesn't silently leak temp files on a version bump.
+        for p in glob.glob(full_db + "*"):
+            if os.path.exists(p):
+                os.unlink(p)
+        for p in (dpath, qpath):
+            if os.path.exists(p):
+                os.unlink(p)
+
+    hits = []
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        sseqid, pident, length, qlen, sstart, send, bitscore = line.split("\t")
+        hits.append({
+            "pident": float(pident), "length": int(length), "qlen": int(qlen),
+            "sstart": int(sstart), "send": int(send), "bitscore": float(bitscore),
+        })
+    if not hits:
+        raise ValueError(
+            f"BGC not found in genome (no BLAST hits at evalue<={evalue})."
+        )
+
+    hits.sort(key=lambda h: h["bitscore"], reverse=True)
+
+    best_score = hits[0]["bitscore"]
+    close_hits = [h for h in hits if h["bitscore"] >= 0.5 * best_score]
+    if len(close_hits) > 1:
+        warnings.append(
+            f"{len(close_hits)} BLAST hits with similar score found "
+            f"(best={best_score:.0f}); picked the top-scoring one — verify "
+            f"this is the correct locus if the genome has repeats."
+        )
+
+    for h in hits:
+        s, e = h["sstart"], h["send"]
+        if s > e:
+            s, e = e, s
+            warnings.append("BGC hit on the reverse strand of the genome.")
+        flat_start, flat_end = s - 1, e  # BLAST is 1-based inclusive
+
+        try:
+            scaffold_id, local_start, local_end = translate_from_flat(
+                flat_start, flat_end, offsets
+            )
+        except ValueError:
+            continue  # spurious cross-scaffold alignment, try next hit
+
+        coverage = 100.0 * h["length"] / bgc_len if bgc_len else 0.0
+        if h["pident"] < min_identity:
+            warnings.append(
+                f"Identity {h['pident']:.1f}% is below the {min_identity}% "
+                f"threshold — this may not be the exact source locus."
+            )
+        if coverage < min_coverage:
+            warnings.append(
+                f"Coverage {coverage:.1f}% is below the {min_coverage}% "
+                f"threshold — the BGC may be split across scaffolds or "
+                f"only partially present in this genome."
+            )
+        if h["pident"] < min_identity or coverage < min_coverage:
+            continue  # keep looking for a better hit before giving up
+
+        return scaffold_id, local_start, local_end, h["pident"], warnings
+
+    raise ValueError(
+        f"No BLAST hit for the BGC cleared identity>={min_identity}% and "
+        f"coverage>={min_coverage}% without spanning a scaffold separator. "
+        f"Provide --start/--end manually."
+    )
 
 
 def check_blast_available() -> bool:
