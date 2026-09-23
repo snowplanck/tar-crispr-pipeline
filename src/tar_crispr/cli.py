@@ -143,17 +143,24 @@ def run(
         bgc_flat_start, _ = translate_to_flat(scaffold_id, local_start, local_end,
                                               genome_offsets)
 
-        # Determine the cluster bounds in the BGC's own coordinate space
-        try:
-            cluster_local = extract_cluster_bounds(bgc_record, gene_kinds=gene_kinds)
-        except ValueError as e:
-            sys.exit(f"ERROR: Could not determine cluster bounds: {e}")
+        # Determine the cluster bounds in the BGC's own coordinate space.
+        # If the BGC has features (antiSMASH region, etc.), use them; if it
+        # is a bare FASTA, the whole BGC is the cluster.
+        if has_features:
+            try:
+                cluster_local = extract_cluster_bounds(bgc_record,
+                                                       gene_kinds=gene_kinds)
+            except ValueError as e:
+                sys.exit(f"ERROR: Could not determine cluster bounds: {e}")
+            local_start_c, local_end_c = cluster_local.start, cluster_local.end
+        else:
+            local_start_c, local_end_c = 0, len(bgc_record.seq)
 
         # Translate to flat genome coordinates
-        start = bgc_flat_start + cluster_local.start
-        end = bgc_flat_start + cluster_local.end
+        start = bgc_flat_start + local_start_c
+        end = bgc_flat_start + local_end_c
         _log(f"Cluster (flat): {start}..{end} "
-             f"(local {cluster_local.start}..{cluster_local.end})", verbose)
+             f"(local {local_start_c}..{local_end_c})", verbose)
         cluster_target = genome_record
     else:
         # Unchanged: start/end (explicit or from --genbank features) are

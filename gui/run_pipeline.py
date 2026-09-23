@@ -15,6 +15,9 @@ from typing import Callable, Optional
 from tar_crispr.config import PipelineConfig
 from tar_crispr.sequence_io import (
     read_sequence,
+    read_genome,
+    locate_bgc_in_genome,
+    translate_to_flat,
     validate_sequence,
     extract_cluster_bounds,
     get_flanking_sequence,
@@ -82,7 +85,10 @@ def run_pipeline(
     _step("Reading input sequences...", 0.05)
     bgc_record = read_sequence(bgc_path)
     vector_record = read_sequence(vector_path)
-    genome_record = read_sequence(genome_path)
+    genome_record = None
+    genome_offsets: dict = {}
+    if genome_path:
+        genome_record, genome_offsets = read_genome(genome_path)
 
     bgc_stats = validate_sequence(bgc_record)
     vector_stats = validate_sequence(vector_record)
@@ -99,20 +105,48 @@ def run_pipeline(
     # --- Step 2: cluster coordinates ---
     _step("Determining cluster bounds...", 0.15)
     has_features = bool(getattr(bgc_record, "features", None))
-    if (start is None or end is None) and not has_features:
-        raise ValueError(
-            "Cannot determine cluster bounds: the BGC file has no annotated "
-            "features and --start/--end were not provided."
+
+    if start is None and end is None and genome_record is not None:
+        # No coordinates given, but a genome is available: locate the BGC
+        # in the genome via BLAST, regardless of whether the BGC has
+        # antiSMASH features. If it does, use those features to define the
+        # cluster bounds in the BGC's own coordinate space, then translate
+        # to flat-genome coordinates by adding the BGC's offset.
+        _step("Locating BGC in genome via BLAST...", 0.15)
+        try:
+            scaffold_id, local_start, local_end, identity, locate_warnings = \
+                locate_bgc_in_genome(bgc_record, genome_record, genome_offsets)
+        except ValueError as e:
+            raise ValueError(
+                f"Could not locate the BGC in the given genome: {e} "
+                f"Pass start/end manually."
+            )
+        bgc_flat_start, _ = translate_to_flat(
+            scaffold_id, local_start, local_end, genome_offsets
         )
-    # When explicit start/end are given, we don't need features; pass them
-    # straight through. Otherwise rely on the BGC annotations (antiSMASH
-    # region, generic cluster, or CDS span), optionally filtered by
-    # gene_kinds.
-    cluster = extract_cluster_bounds(
-        bgc_record if has_features else genome_record,
-        start, end,
-        gene_kinds=gene_kinds,
-    )
+        if has_features:
+            try:
+                cluster_local = extract_cluster_bounds(bgc_record,
+                                                       gene_kinds=gene_kinds)
+            except ValueError as e:
+                raise ValueError(f"Could not determine cluster bounds: {e}")
+            local_start_c, local_end_c = cluster_local.start, cluster_local.end
+        else:
+            local_start_c, local_end_c = 0, len(bgc_record.seq)
+        start = bgc_flat_start + local_start_c
+        end = bgc_flat_start + local_end_c
+        cluster = extract_cluster_bounds(genome_record, start, end)
+    else:
+        # Coordinates provided explicitly (or BGC has features we can read
+        # directly): treat them as bgc_record-relative, matching the CLI.
+        if (start is None or end is None) and not has_features:
+            raise ValueError(
+                "Cannot determine cluster bounds: the BGC file has no "
+                "annotated features and start/end were not provided."
+            )
+        cluster = extract_cluster_bounds(
+            bgc_record, start, end, gene_kinds=gene_kinds,
+        )
 
     # --- Step 3: flanks ---
     _step("Extracting flanks...", 0.25)
