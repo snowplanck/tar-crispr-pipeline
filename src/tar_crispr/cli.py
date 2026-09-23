@@ -21,7 +21,7 @@ from tar_crispr.fragment_ends import extract_fragment
 from tar_crispr.homology_arms import design_homology_arms
 from tar_crispr.primer_design import design_tailed_primers
 from tar_crispr.assembly_sim import simulate_pydna_assembly
-from tar_crispr.report_generator import generate_report
+from tar_crispr.report_generator import generate_report, generate_construct_map
 
 app = typer.Typer(
     help="TAR-CRISPR: Automated sgRNA + homology arm + primer design for CATCH-style BGC capture.",
@@ -304,10 +304,29 @@ def run(
         selected_sgRNAs=selected,
     )
 
+    # Optional: render a circular map of the final construct.
+    construct_png = Path(output) / "construct_map.png"
+    try:
+        generate_construct_map(
+            final_sequence=assembly_result.final_sequence,
+            vector_record=vector_record,
+            bgc_record=bgc_record,
+            vector_cut_left=vector_cut_left,
+            vector_cut_right=vector_cut_right,
+            bgc_len=len(fragment.sequence),
+            output_png=str(construct_png),
+            bgc_name=cluster.name or "BGC",
+        )
+    except Exception as e:
+        _log(f"WARNING: Could not render construct map: {e}", verbose)
+        construct_png = None
+
     _log(f"\nPipeline complete!", verbose)
     _log(f"Report: {report_path}", verbose)
     _log(f"SVG map: {Path(output) / 'cluster_map.svg'}", verbose)
     _log(f"Primers CSV: {Path(output) / 'primers.csv'}", verbose)
+    if construct_png is not None:
+        _log(f"Construct map: {construct_png}", verbose)
 
     if not assembly_result.success:
         _log("WARNING: Assembly simulation reported issues. Check report for details.", verbose)

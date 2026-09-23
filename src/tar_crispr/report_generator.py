@@ -199,6 +199,244 @@ def generate_svg_cluster_map(cluster_seq: str,
     return svg
 
 
+def generate_construct_map(final_sequence: str,
+                            vector_record,
+                            bgc_record,
+                            vector_cut_left: int,
+                            vector_cut_right: int,
+                            bgc_len: int,
+                            output_png: str,
+                            bgc_name: str = "BGC",
+                            enzyme_site: str = "ATTTAAAT") -> str:
+    """Render a publication-style circular map of the final construct.
+
+    Uses pyCirclize to produce a clean Circos-style figure with three
+    sectors (vector 5', BGC, vector 3'), absolute bp coordinates, and
+    features colour-coded by category:
+      - vector backbone, origins, resistance markers
+      - BGC CDS split by gene_kind (biosynthetic / additional / regulatory
+        / transport / other)
+      - PKS/NRPS catalytic domains (aSDomain) in a separate inner track
+
+    Outputs are written next to *output_png* with the same stem:
+        <stem>.png  (300 dpi raster)
+        <stem>.pdf  (vector, for submission)
+        <stem>.svg  (vector, for editing)
+
+    Returns the path to the PNG. If pyCirclize is not installed, raises
+    ImportError so the caller can fall back gracefully.
+    """
+    try:
+        from pycirclize import Circos
+    except ImportError as e:
+        raise ImportError(
+            "pyCirclize is required for construct maps. "
+            "Install with: pip install pycirclize"
+        ) from e
+
+    # ---- Palette ----
+    C_VEC_BACKBONE = "#B0BEC5"
+    C_VEC_RESIST = "#2E7D32"
+    C_VEC_ORI = "#0D47A1"
+    C_BGC_PKS = "#E65100"
+    C_BGC_ADD = "#FFB74D"
+    C_BGC_REG = "#7B1FA2"
+    C_BGC_TRANS = "#1976D2"
+    C_BGC_OTHER = "#9E9E9E"
+    C_ASDOMAIN = "#FBC02D"
+
+    def _vector_color(f):
+        q = f.qualifiers or {}
+        text = " ".join(
+            str(v[0]) if isinstance(v, list) else str(v) for v in q.values()
+        ).lower()
+        if any(k in text for k in ("resistance", "aac", "apramycin",
+                                   "kanamycin", "neomycin", "ura3", "trp1")):
+            return C_VEC_RESIST
+        if any(k in text for k in ("origin", "ori", "replication", "bom")):
+            return C_VEC_ORI
+        return C_VEC_BACKBONE
+
+    def _bgc_color(f):
+        kind = (f.qualifiers.get("gene_kind", [""])[0] or "").lower()
+        return {
+            "biosynthetic": C_BGC_PKS,
+            "biosynthetic-additional": C_BGC_ADD,
+            "regulatory": C_BGC_REG,
+            "transport": C_BGC_TRANS,
+            "other": C_BGC_OTHER,
+        }.get(kind, C_BGC_OTHER)
+
+    # ---- Sector sizes (absolute bp in construct coordinates) ----
+    vector_len = len(vector_record.seq)
+    vector_left_len = vector_cut_left
+    vector_right_len = vector_len - vector_cut_right
+    construct_len = vector_left_len + bgc_len + vector_right_len
+
+    sectors = {
+        "Vector 5'": (0, vector_left_len),
+        "BGC": (vector_left_len, vector_left_len + bgc_len),
+        "Vector 3'": (vector_left_len + bgc_len, construct_len),
+    }
+
+    # Title. GenBank records exported by Addgene (and some other tools)
+    # carry "." as the record id and a long generic description, so we do
+    # not try to guess a meaningful vector name from them. Instead we use
+    # a short generic label; callers that want a nicer title can pass
+    # bgc_name.
+    def _clean(name, fallback):
+        name = (name or "").strip()
+        return name if name and name != "." else fallback
+
+    vector_label = _clean(vector_record.id, "Vector")
+    bgc_label = _clean(bgc_name, "BGC")
+
+    circos = Circos(sectors, space=3)
+    circos.text(
+        f"{vector_label} + {bgc_label} ({construct_len:,} bp)",
+        r=118, size=13,
+    )
+
+    # ---- Tick helper ----
+    def _nice_interval(span, target_ticks=5):
+        raw = span / target_ticks
+        for step in (100, 200, 500, 1000, 2000, 5000, 10000):
+            if raw <= step:
+                return step
+        return 10000
+
+    # ---- Plot ----
+    for sector_name, sector in zip(sectors, circos.sectors):
+        span = sector.end - sector.start
+        offset = sector.start
+
+        ruler = sector.add_track((96, 100))
+        ruler.axis()
+        if span >= 5000:
+            ruler.xticks_by_interval(
+                interval=_nice_interval(span),
+                label_size=9,
+                show_endlabel=False,
+                tick_length=3,
+            )
+        else:
+            ruler.xticks_by_interval(
+                interval=span,
+                label_size=9,
+                show_endlabel=False,
+                tick_length=3,
+            )
+        sector.text(sector_name, r=109, size=13)
+
+        feature_track = sector.add_track((75, 93))
+
+        if sector_name == "BGC":
+            dom_track = sector.add_track((62, 71))
+            for f in bgc_record.features:
+                if f.type != "aSDomain":
+                    continue
+                try:
+                    s, e = int(f.location.start), int(f.location.end)
+                except Exception:
+                    continue
+                # Same clipping as CDS above.
+                if s >= bgc_len:
+                    continue
+                e = min(e, bgc_len)
+                if e <= s:
+                    continue
+                dom_track.rect(offset + s, offset + e, color=C_ASDOMAIN,
+                               ec="black", lw=0.3)
+
+            for f in bgc_record.features:
+                if f.type != "CDS":
+                    continue
+                try:
+                    s, e = int(f.location.start), int(f.location.end)
+                except Exception:
+                    continue
+                # The bgc_record may be the full annotated file while the
+                # actual fragment inserted (bgc_len) can be shorter (e.g.
+                # when gene_kinds filtering trimmed the edges). Clip the
+                # feature to [0, bgc_len] so we don't draw past the sector.
+                if s >= bgc_len:
+                    continue
+                e = min(e, bgc_len)
+                if e <= s:
+                    continue
+                feature_track.rect(offset + s, offset + e,
+                                   color=_bgc_color(f), ec="black", lw=0.3)
+        elif sector_name == "Vector 5'":
+            for f in vector_record.features:
+                if f.type == "source":
+                    continue
+                try:
+                    s, e = int(f.location.start), int(f.location.end)
+                except Exception:
+                    continue
+                if e > vector_cut_left:
+                    continue
+                feature_track.rect(offset + s, offset + e,
+                                   color=_vector_color(f), ec="black", lw=0.3)
+        else:  # Vector 3'
+            for f in vector_record.features:
+                if f.type == "source":
+                    continue
+                try:
+                    s, e = int(f.location.start), int(f.location.end)
+                except Exception:
+                    continue
+                if s < vector_cut_right:
+                    continue
+                new_s = s - vector_cut_right
+                new_e = e - vector_cut_right
+                feature_track.rect(offset + new_s, offset + new_e,
+                                   color=_vector_color(f), ec="black", lw=0.3)
+
+        # The start (0) and end (construct_len) coordinates are already shown
+        # in the figure title; labeling them again with sector.text() was
+        # fighting pyCirclize's internal coordinate validation (with space>0
+        # the sector bounds shift by the padding, so an x that is inside
+        # [sector.start, sector.end] can still be rejected). Skipped on
+        # purpose.
+
+    # ---- Render + legend ----
+    fig = circos.plotfig()
+
+    import matplotlib.patches as mpatches
+    handles = [
+        mpatches.Patch(color=C_VEC_BACKBONE, label="Vector backbone"),
+        mpatches.Patch(color=C_VEC_RESIST,   label="Resistance / marker"),
+        mpatches.Patch(color=C_VEC_ORI,      label="Origin of replication"),
+        mpatches.Patch(color=C_BGC_PKS,      label="BGC - PKS core"),
+        mpatches.Patch(color=C_BGC_ADD,      label="BGC - additional"),
+        mpatches.Patch(color=C_BGC_REG,      label="BGC - regulatory"),
+        mpatches.Patch(color=C_BGC_TRANS,    label="BGC - transport"),
+        mpatches.Patch(color=C_BGC_OTHER,    label="BGC - other"),
+        mpatches.Patch(color=C_ASDOMAIN,     label="Catalytic domain"),
+    ]
+    fig.legend(
+        handles=handles,
+        loc="lower center",
+        ncol=5,
+        frameon=False,
+        fontsize=9,
+        bbox_to_anchor=(0.5, -0.08),
+    )
+
+    # ---- Save PNG + PDF + SVG ----
+    import os
+    stem, _ = os.path.splitext(output_png)
+    fig.savefig(stem + ".png", dpi=300, bbox_inches="tight")
+    fig.savefig(stem + ".pdf", bbox_inches="tight")
+    fig.savefig(stem + ".svg", bbox_inches="tight")
+
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+    return stem + ".png"
+
+
 def generate_report(sgRNAs: dict,
                     fragment_seq: str,
                     homology_arms: dict,
