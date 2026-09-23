@@ -117,11 +117,14 @@ def run(
     # message instead of raising a ValueError deep in the call stack.
     has_features = bool(getattr(bgc_record, "features", None))
 
-    # If the user has a genome AND an isolated BGC record (the common case:
-    # a BGC exported from antiSMASH, plus the genome it came from) but did
-    # not say where in the genome it is, locate it automatically via BLAST
-    # instead of requiring --start/--end or annotated features.
-    if start is None and end is None and genome_record is not None and not has_features:
+    # If the user has a genome AND a BGC record but did not say where in
+    # the genome it is, locate the BGC via BLAST. This applies whether or
+    # not the BGC has features:
+    #   - no features -> the whole BGC is the cluster, its offset in the
+    #     flat genome is the cluster location.
+    #   - has features (antiSMASH) -> the features define the cluster
+    #     RELATIVE TO THE BGC; we add the BGC's flat offset to translate.
+    if start is None and end is None and genome_record is not None:
         _log("No --start/--end given; locating BGC in genome via BLAST...", verbose)
         try:
             scaffold_id, local_start, local_end, identity, locate_warnings = \
@@ -135,15 +138,26 @@ def run(
         for w in locate_warnings:
             _log(f"WARNING: {w}", verbose)
         _log(f"BGC located: {scaffold_id}, identity={identity:.1f}%", verbose)
-        start, end = translate_to_flat(scaffold_id, local_start, local_end,
-                                       genome_offsets)
-        cluster_target = genome_record  # coordinates are now in the flat genome
+
+        # Offset of the BGC in the flat genome
+        bgc_flat_start, _ = translate_to_flat(scaffold_id, local_start, local_end,
+                                              genome_offsets)
+
+        # Determine the cluster bounds in the BGC's own coordinate space
+        try:
+            cluster_local = extract_cluster_bounds(bgc_record, gene_kinds=gene_kinds)
+        except ValueError as e:
+            sys.exit(f"ERROR: Could not determine cluster bounds: {e}")
+
+        # Translate to flat genome coordinates
+        start = bgc_flat_start + cluster_local.start
+        end = bgc_flat_start + cluster_local.end
+        _log(f"Cluster (flat): {start}..{end} "
+             f"(local {cluster_local.start}..{cluster_local.end})", verbose)
+        cluster_target = genome_record
     else:
-        # Unchanged from the original behavior: start/end (explicit or from
-        # --genbank features) are always relative to bgc_record, never to
-        # genome_record — genome_record has no features of its own, and by
-        # convention the caller's --start/--end already match the same
-        # coordinate space bgc_record was extracted from.
+        # Unchanged: start/end (explicit or from --genbank features) are
+        # always relative to bgc_record, never to genome_record.
         cluster_target = bgc_record
 
     if (start is None or end is None) and not has_features and genbank is None:
