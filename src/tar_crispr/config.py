@@ -29,6 +29,11 @@ class PipelineConfig:
     mode: str = "in-vitro"
     seed_length: int = 12
     exclude_internal_cuts: bool = True
+    # "mit": genome-wide, position-weighted off-target score (Hsu 2013-style);
+    # "legacy": plain count of look-alike sites (old behaviour).
+    specificity_model: str = "mit"
+    n_pairs: int = 5          # guide pairs for which homology arms are evaluated
+    min_specificity: float = 50.0   # warn below this guide specificity (0-100)
     blast_available: Optional[bool] = None
     rnafold_available: Optional[bool] = None
 
@@ -57,6 +62,8 @@ class PAMCandidate:
     polyt_flag: bool
     internal_cuts: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    specificity_score: Optional[float] = None   # 0-100, higher = more specific
+    n_offtargets: int = 0
 
 @dataclass
 class CutSite:
@@ -68,8 +75,10 @@ class CutSite:
     mismatches: int            # total protospacer mismatches
     seed_mismatches: int       # mismatches in the PAM-proximal seed
     severity: str              # "high" or "medium"
-    locus: str = "fragment"    # "fragment", "vector" or "yeast"
+    locus: str = "fragment"    # "fragment", "vector", "yeast" or "genome"
     site: str = ""             # genomic protospacer sequence at the site
+    score: float = 0.0         # off-target hit score (0-1), genome scan only
+    mismatch_positions: tuple = ()  # 0 = PAM-distal ... 19 = PAM-proximal
 
 @dataclass
 class HomologyArm:

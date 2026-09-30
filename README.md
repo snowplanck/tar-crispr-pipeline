@@ -117,6 +117,8 @@ Options:
   --auto-select        Auto-select top-ranked sgRNA (default)
   --mode               Cas9 delivery: in-vitro (default) or in-vivo (see below)
   --yeast-genome PATH  S. cerevisiae genome FASTA for the host off-target check (in-vivo)
+  --specificity-model  sgRNA off-target model: mit (default) or legacy
+  --n-pairs            Best guide pairs for which homology arms are evaluated (default: 5)
   --allow-internal-cuts  Keep sgRNAs that also cut inside the BGC (reported as warnings)
   --verbose            Verbose output
 ```
@@ -201,6 +203,14 @@ steps (e.g. restricting sgRNAs to a curated list).
 `--mode in-vivo` models Cas9 expressed in yeast: poly-T runs (Pol III terminator) are penalised, and the vector is scanned for cut sites; pass `--yeast-genome` to also scan the host genome (otherwise the report warns that it was not evaluated).
 
 In both modes every guide is scanned for additional cut sites inside the fragment that will be captured (PAM-aware, seed-weighted: NGG with a perfect 12-nt seed and at most `--max-mismatches` mismatches is high confidence; NAG/NGA PAMs or a single seed mismatch are medium). Guides with a high-confidence site inside the BGC are discarded, and the left/right pair is the best-ranked combination with no such site. This is a heuristic screen, not a cleavage-efficiency model.
+
+## Guide scoring and pair ranking
+
+Each candidate guide gets a genome-wide **specificity score (0–100)** in the style of the MIT server (Hsu et al. 2013): every PAM-adjacent near-match in the genome is scored by where its mismatches fall (PAM-proximal seed mismatches abolish cutting; PAM-distal ones are tolerated), and the hits are combined as `100 / (1 + Σ hit scores)`. A guide with no other site scores 100; one perfect extra copy scores 50. NAG/NGA PAM sites count with a reduced weight. The positional weights were reproduced from the published model — verify them against the paper or CRISPOR before citing absolute scores. `--specificity-model legacy` restores the old plain count.
+
+The left and right guides are then ranked **as pairs** (they define one fragment): score = weakest guide's specificity − penalties for guide quality (mode-aware), extra flanking DNA, medium-confidence cut sites, and — for the `--n-pairs` best pairs — homology-arm problems (non-unique arms, structure, arms shifted inward so end bases of the BGC are not captured). Pairs with a high-confidence cut site inside the fragment are excluded. The report lists the ranking and the score breakdown of the pair used.
+
+Not modelled: on-target cleavage efficiency (e.g. Doench Rule Set 2). The score ranks specificity and practical design constraints only.
 
 ## Output Files
 

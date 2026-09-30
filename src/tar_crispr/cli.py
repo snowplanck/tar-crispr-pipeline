@@ -18,9 +18,8 @@ from tar_crispr.sequence_io import (
 )
 from tar_crispr.pam_finder import design_sgRNAs, find_pam_sites, rank_sgRNAs
 from tar_crispr.fragment_ends import extract_fragment
-from tar_crispr.cut_specificity import (
-    build_index_from_fasta, select_valid_pair, validate_guide_pair,
-)
+from tar_crispr.cut_specificity import build_index_from_fasta
+from tar_crispr.pair_ranking import rank_pairs, best_pair
 from tar_crispr.homology_arms import design_homology_arms
 from tar_crispr.primer_design import design_tailed_primers
 from tar_crispr.assembly_sim import simulate_pydna_assembly
@@ -68,6 +67,12 @@ def run(
                                   "checks the vector and the yeast genome for cut sites)"),
     yeast_genome: Optional[str] = typer.Option(None, "--yeast-genome",
                                                help="S. cerevisiae genome FASTA for off-target cut check (in-vivo mode)"),
+    specificity_model: str = typer.Option("mit", "--specificity-model",
+                                           help="sgRNA off-target model: 'mit' (genome-wide, position-weighted "
+                                                "score, default) or 'legacy' (plain count of look-alike sites)"),
+    n_pairs: int = typer.Option(5, "--n-pairs",
+                                help="Minimum number of guide pairs whose homology arms are evaluated (more are "
+                                     "evaluated if needed to prove the best pair)"),
     allow_internal_cuts: bool = typer.Option(False, "--allow-internal-cuts",
                                              help="Keep sgRNAs that also cut inside the BGC (reported as warnings)"),
     verbose: bool = typer.Option(False, "--verbose", "-V", help="Verbose output"),
@@ -75,8 +80,12 @@ def run(
     """Run the full TAR-CRISPR pipeline end-to-end."""
     if mode not in ("in-vitro", "in-vivo"):
         sys.exit(f"ERROR: --mode must be 'in-vitro' or 'in-vivo', got {mode!r}")
+    if specificity_model not in ("mit", "legacy"):
+        sys.exit(f"ERROR: --specificity-model must be 'mit' or 'legacy', got {specificity_model!r}")
     config = PipelineConfig(
         mode=mode,
+        specificity_model=specificity_model,
+        n_pairs=max(1, n_pairs),
         exclude_internal_cuts=not allow_internal_cuts,
         pam_window=pam_window,
         top_n_sgRNAs=top_n,
@@ -265,35 +274,51 @@ def run(
         yeast_index = build_index_from_fasta(
             yeast_genome, config.protospacer_length, config.seed_length)
 
-    if auto_select and sgRNAs["left"] and sgRNAs["right"]:
-        selected, cut_report, n_tried = select_valid_pair(
-            sgRNAs, genome_seq, config, vec_for_check, yeast_index)
-        if selected is None:
-            details = "\n  - ".join(cut_report.hard_issues) if cut_report else "no valid left/right ordering"
+    _log("Ranking guide pairs (specificity, cut-site safety, flanks, homology arms)...", verbose)
+    pairs = rank_pairs(sgRNAs, genome_seq, cluster.start, cluster.end, config,
+                       vec_for_check, yeast_index)
+    top = best_pair(pairs)
+    if not pairs:
+        sys.exit("ERROR: no left/right sgRNA pair flanks the cluster. "
+                 "Widen --pam-window or raise --top-n.")
+
+    if auto_select:
+        if top is None:
+            details = "\n  - ".join(pairs[0].cut_report.hard_issues)
             if not allow_internal_cuts:
                 sys.exit(
-                    f"ERROR: none of the {n_tried} sgRNA pair(s) tried is free of unwanted "
+                    f"ERROR: none of the {len(pairs)} sgRNA pair(s) is free of unwanted "
                     f"Cas9 cut sites (mode: {config.mode}). Best-ranked pair:\n  - {details}\n"
                     "  Widen --pam-window / raise --top-n, or use --allow-internal-cuts "
                     "to proceed anyway (issues are kept as warnings in the report).")
-            selected = {"left": sgRNAs["left"][0], "right": sgRNAs["right"][0]}
+            top = pairs[0]
             _log("WARNING: proceeding with the top-ranked pair despite cut-site issues", verbose)
-        _log(f"Auto-selected left: {selected['left'].protospacer}", verbose)
-        _log(f"Auto-selected right: {selected['right'].protospacer}", verbose)
+        chosen = top
     else:
-        selected = _select_sgRNAs_interactive(sgRNAs, verbose)
-        cut_report = validate_guide_pair(
-            selected["left"], selected["right"], genome_seq, config,
-            vec_for_check, yeast_index)
-        if not cut_report.ok and not allow_internal_cuts:
+        manual = _select_sgRNAs_interactive(sgRNAs, verbose)
+        chosen = next((p for p in pairs
+                       if p.left.cut_position == manual["left"].cut_position
+                       and p.right.cut_position == manual["right"].cut_position), None)
+        if chosen is None:
+            sys.exit("ERROR: the selected guides do not form a valid pair around the cluster.")
+        if chosen.excluded and not allow_internal_cuts:
             sys.exit("ERROR: the selected pair has unwanted Cas9 cut sites:\n  - "
-                     + "\n  - ".join(cut_report.hard_issues)
+                     + "\n  - ".join(chosen.cut_report.hard_issues)
                      + "\n  Use --allow-internal-cuts to override.")
-    for w in cut_report.warnings if cut_report else []:
+    selected = {"left": chosen.left, "right": chosen.right}
+    cut_report = chosen.cut_report
+    _log(f"Selected pair #{chosen.rank}: score {chosen.score:.1f}, "
+         f"min specificity {chosen.specificity}, fragment {chosen.fragment_length} bp", verbose)
+    _log(f"Auto-selected left: {selected['left'].protospacer}", verbose)
+    _log(f"Auto-selected right: {selected['right'].protospacer}", verbose)
+    for w in cut_report.warnings:
         _log(f"WARNING: {w}", verbose)
-    if cut_report and not cut_report.ok:
-        for msg in cut_report.hard_issues:
-            _log(f"WARNING (overridden): {msg}", verbose)
+    for msg in cut_report.hard_issues:
+        _log(f"WARNING (overridden): {msg}", verbose)
+    for g in (chosen.left, chosen.right):
+        if g.specificity_score is not None and g.specificity_score < config.min_specificity:
+            _log(f"WARNING: guide {g.protospacer} has specificity "
+                 f"{g.specificity_score} (< {config.min_specificity})", verbose)
 
     # Step 3: Extract fragment
     _log("Step 3: Extracting Cas9 fragment...", verbose)
@@ -359,6 +384,7 @@ def run(
         output_dir=output,
         selected_sgRNAs=selected,
         cut_safety=cut_report,
+        pair_ranking=pairs,
     )
 
     # Optional: render a circular map of the final construct.
@@ -493,12 +519,14 @@ def sgrna_command(
     print(f"\n=== Left (upstream) sgRNAs ===")
     for i, sg in enumerate(sgRNAs["left"]):
         print(f"  {i+1}. {sg.protospacer} | {sg.strand} strand | "
-              f"cut={sg.cut_position} | GC={sg.gc_percent}% | Poly-T={'Y' if sg.polyt_flag else 'N'}")
+              f"cut={sg.cut_position} | GC={sg.gc_percent}% | Poly-T={'Y' if sg.polyt_flag else 'N'} | "
+              f"Spec={sg.specificity_score if sg.specificity_score is not None else '-'}")
 
     print(f"\n=== Right (downstream) sgRNAs ===")
     for i, sg in enumerate(sgRNAs["right"]):
         print(f"  {i+1}. {sg.protospacer} | {sg.strand} strand | "
-              f"cut={sg.cut_position} | GC={sg.gc_percent}% | Poly-T={'Y' if sg.polyt_flag else 'N'}")
+              f"cut={sg.cut_position} | GC={sg.gc_percent}% | Poly-T={'Y' if sg.polyt_flag else 'N'} | "
+              f"Spec={sg.specificity_score if sg.specificity_score is not None else '-'}")
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from typing import Optional
 from Bio.SeqUtils import gc_fraction
 from tar_crispr.config import PipelineConfig, PAMCandidate
 from tar_crispr.cut_specificity import build_site_index, find_cut_sites
+from tar_crispr.guide_scoring import annotate_specificity
 
 
 def complement(seq: str) -> str:
@@ -291,7 +292,9 @@ def rank_sgRNAs(candidates: list[PAMCandidate],
     - Base score 100
     - -15 penalty for poly-T (Pol III termination signal) — in-vivo mode only;
       in-vitro guides are T7-transcribed, where a TTTT run is harmless
-    - -5 penalty per off-target beyond the perfect match
+    - specificity: the position-weighted genome-wide score (0-100) when the
+      candidate was annotated by ``guide_scoring`` (default), otherwise
+      -5 per look-alike site beyond the perfect match (legacy)
     - +5 bonus if GC% in 40–65%, -10 if GC% > 75
     """
     scored: list[tuple[PAMCandidate, float]] = []
@@ -300,11 +303,15 @@ def rank_sgRNAs(candidates: list[PAMCandidate],
         if not c.protospacer:
             scored.append((c, -1))
             continue
-        off_targets = check_specificity(
-            c.protospacer, genome_seq, config.max_mismatches,
-            config.blast_available or False,
-        )
-        score -= 5 * max(0, off_targets - 1)
+        if c.specificity_score is not None:
+            # Position-weighted genome-wide score (0-100), see guide_scoring.
+            score = c.specificity_score
+        else:
+            off_targets = check_specificity(
+                c.protospacer, genome_seq, config.max_mismatches,
+                config.blast_available or False,
+            )
+            score -= 5 * max(0, off_targets - 1)
         if c.polyt_flag and config.mode == "in-vivo":
             score -= 15
         if config.mode == "in-vitro" and not c.protospacer.startswith("G"):
@@ -373,6 +380,9 @@ def design_sgRNAs(cluster_seq: str,
     downstream_offset = cluster_end
     left_candidates = _offset_candidates(left_candidates, upstream_offset)
     right_candidates = _offset_candidates(right_candidates, downstream_offset)
+
+    if config.specificity_model == "mit":
+        annotate_specificity(left_candidates + right_candidates, genome_seq, config)
 
     left_ranked = rank_sgRNAs(left_candidates, genome_seq, config)
     right_ranked = rank_sgRNAs(right_candidates, genome_seq, config)

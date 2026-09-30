@@ -15,8 +15,8 @@ from tar_crispr.config import (
 def _format_sgRNA_table(sgRNAs: dict) -> str:
     """Format sgRNA candidates into a Markdown table."""
     lines = [
-        "| End | Strand | Position | Protospacer (20nt) | PAM | Cut Pos | GC% | Poly-T |",
-        "|------|--------|----------|-------------------|-----|---------|-----|--------|",
+        "| End | Strand | Position | Protospacer (20nt) | PAM | Cut Pos | GC% | Poly-T | Specificity |",
+        "|------|--------|----------|-------------------|-----|---------|-----|--------|-------------|",
     ]
     for end_label, candidates in sgRNAs.items():
         end_name = {"left": "Upstream", "right": "Downstream"}.get(end_label, end_label)
@@ -24,8 +24,33 @@ def _format_sgRNA_table(sgRNAs: dict) -> str:
             lines.append(
                 f"| {end_name} | {sg.strand} | {sg.position} | "
                 f"`{sg.protospacer}` | {sg.pam} | {sg.cut_position} | "
-                f"{sg.gc_percent} | {'Yes' if sg.polyt_flag else 'No'} |"
+                f"{sg.gc_percent} | {'Yes' if sg.polyt_flag else 'No'} | "
+                f"{sg.specificity_score if sg.specificity_score is not None else '—'} |"
             )
+    return "\n".join(lines)
+
+
+_COMPONENT_LABELS = {
+    "specificity": "weakest-guide specificity", "guide_quality": "guide quality",
+    "flank": "extra flank", "cut_warnings": "cut-site warnings", "arms": "homology arms",
+}
+
+
+def _format_pair_table(pairs: list, limit: int = 10) -> str:
+    """Markdown table of the best-ranked guide pairs."""
+    lines = [
+        "| # | Left guide | Right guide | Fragment (bp) | Min spec. | Score | Status |",
+        "|---|------------|-------------|---------------|-----------|-------|--------|",
+    ]
+    for p in pairs[:limit]:
+        status = ("excluded (cut site)" if p.excluded
+                  else "arms evaluated" if p.arms_evaluated else "arms not evaluated")
+        spec = f"{p.specificity:.1f}" if p.specificity is not None else "—"
+        lines.append(
+            f"| {p.rank} | `{p.left.protospacer}` | `{p.right.protospacer}` | "
+            f"{p.fragment_length} | {spec} | {p.score:.1f} | {status} |")
+    if len(pairs) > limit:
+        lines.append(f"| … | {len(pairs) - limit} more pair(s) not shown | | | | | |")
     return "\n".join(lines)
 
 
@@ -447,7 +472,8 @@ def generate_report(sgRNAs: dict,
                     genome_stats: dict,
                     output_dir: str,
                     selected_sgRNAs: Optional[dict] = None,
-                    cut_safety=None) -> str:
+                    cut_safety=None,
+                    pair_ranking: Optional[list] = None) -> str:
     """Generate the final report in Markdown format with embedded SVG.
 
     Parameters
@@ -475,6 +501,9 @@ def generate_report(sgRNAs: dict,
     cut_safety : PairReport, optional
         Result of the Cas9 cut-site safety checks for the selected pair
         (from ``cut_specificity``); adds a section to the report.
+    pair_ranking : list, optional
+        Ranked ``PairCandidate`` objects (from ``pair_ranking.rank_pairs``);
+        adds the pair-ranking table and the score breakdown of the pair in use.
 
     Returns
     -------
@@ -542,6 +571,30 @@ def generate_report(sgRNAs: dict,
     md.append(f"\n### All Candidate sgRNAs\n")
     md.append(_format_sgRNA_table(sgRNAs))
     md.append("")
+
+    # Pair ranking
+    if pair_ranking:
+        md.append("### Guide pair ranking\n")
+        md.append("Pairs are scored on a 0–100 scale: the weakest guide's genome-wide "
+                  "specificity, minus penalties for guide quality, extra flanking DNA, "
+                  "cut-site warnings and (for the best pairs) homology-arm problems. "
+                  "Weights are heuristic constants, not a fitted model.\n")
+        md.append(_format_pair_table(pair_ranking))
+        md.append("")
+        used = next((p for p in pair_ranking
+                     if p.left.cut_position == left_sg.cut_position
+                     and p.right.cut_position == right_sg.cut_position), None)
+        if used is not None:
+            md.append(f"**Selected pair (#{used.rank}) score breakdown:**\n")
+            for key, val in used.components.items():
+                md.append(f"- {_COMPONENT_LABELS.get(key, key)}: {val + 0.0:+.1f}" if key != "specificity"
+                          else f"- {_COMPONENT_LABELS[key]}: {val:.1f}")
+            md.append(f"- **total: {used.score:.1f}**")
+            md.append("")
+            if used.notes:
+                md.append("**Notes:**\n")
+                md.extend(f"- {n}" for n in used.notes)
+                md.append("")
 
     # Cas9 cut-site safety (mode-dependent)
     md.append(f"### Cas9 cut-site safety (mode: `{config.mode}`)\n")
