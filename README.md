@@ -115,6 +115,9 @@ Options:
                        sgRNA specificity (much faster; recommended unless you
                        need BLAST-grade off-target resolution)
   --auto-select        Auto-select top-ranked sgRNA (default)
+  --mode               Cas9 delivery: in-vitro (default) or in-vivo (see below)
+  --yeast-genome PATH  S. cerevisiae genome FASTA for the host off-target check (in-vivo)
+  --allow-internal-cuts  Keep sgRNAs that also cut inside the BGC (reported as warnings)
   --verbose            Verbose output
 ```
 
@@ -190,6 +193,14 @@ The `run` command in `cli.py` performs exactly this sequence and writes
 `report.md`, `report.html`, `cluster_map.svg`, and `primers.csv` into
 `--output`. Use the CLI unless you need to inject custom logic between
 steps (e.g. restricting sgRNAs to a curated list).
+
+## Cas9 delivery mode and cut-site safety
+
+`--mode in-vitro` (default) models the classic workflow: high-molecular-weight genomic DNA is digested with Cas9/sgRNA before transformation, so the capture vector and the yeast genome never see Cas9. sgRNAs are T7-transcribed (a 5' G is recommended; the report notes guides lacking it) and poly-T runs are not penalised.
+
+`--mode in-vivo` models Cas9 expressed in yeast: poly-T runs (Pol III terminator) are penalised, and the vector is scanned for cut sites; pass `--yeast-genome` to also scan the host genome (otherwise the report warns that it was not evaluated).
+
+In both modes every guide is scanned for additional cut sites inside the fragment that will be captured (PAM-aware, seed-weighted: NGG with a perfect 12-nt seed and at most `--max-mismatches` mismatches is high confidence; NAG/NGA PAMs or a single seed mismatch are medium). Guides with a high-confidence site inside the BGC are discarded, and the left/right pair is the best-ranked combination with no such site. This is a heuristic screen, not a cleavage-efficiency model.
 
 ## Output Files
 

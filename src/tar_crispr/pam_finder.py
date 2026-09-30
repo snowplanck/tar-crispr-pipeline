@@ -13,9 +13,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import dataclasses
 from typing import Optional
 from Bio.SeqUtils import gc_fraction
 from tar_crispr.config import PipelineConfig, PAMCandidate
+from tar_crispr.cut_specificity import build_site_index, find_cut_sites
 
 
 def complement(seq: str) -> str:
@@ -108,14 +110,12 @@ def find_pam_sites(sequence: str,
             continue
         protospacer_rc = seq[pam_start + 3:proto_end]
         protospacer = reverse_complement(protospacer_rc)
-        # Cas9 cuts 3 bp upstream of PAM on the reverse strand.
-        # On the forward strand this maps to: proto_end + 3 - half ... 
-        # Equivalently: the cut is at position (pam_start + 3) on the
-        # reverse strand, which is len(seq) - (pam_start + 3) on forward.
-        # But for practical purposes the cut on forward strand = proto_end
-        # because the cut is right after the protospacer on the reverse strand.
-        # The standard convention: cut at position proto_end (i.e. CCN_start + 23).
-        cut_pos = proto_end  # = pam_start + 3 + protospacer_length
+        # On the reverse strand the PAM (NGG) reads CCN on the forward strand
+        # at [pam_start, pam_start+3). The protospacer lies immediately to its
+        # right, and Cas9 cuts 3 bp from the PAM *inside* the protospacer, i.e.
+        # at forward boundary pam_start + 3 + 3 (mirror image of the forward
+        # strand rule PAM_start - 3).
+        cut_pos = pam_start + 3 + 3
         # Position on forward strand (0-based start of protospacer_rc)
         fwd_pos = pam_start + 3
         candidates.append(PAMCandidate(
@@ -289,7 +289,8 @@ def rank_sgRNAs(candidates: list[PAMCandidate],
 
     Scoring (higher is better):
     - Base score 100
-    - -15 penalty for poly-T (Pol III termination signal)
+    - -15 penalty for poly-T (Pol III termination signal) — in-vivo mode only;
+      in-vitro guides are T7-transcribed, where a TTTT run is harmless
     - -5 penalty per off-target beyond the perfect match
     - +5 bonus if GC% in 40–65%, -10 if GC% > 75
     """
@@ -304,8 +305,11 @@ def rank_sgRNAs(candidates: list[PAMCandidate],
             config.blast_available or False,
         )
         score -= 5 * max(0, off_targets - 1)
-        if c.polyt_flag:
+        if c.polyt_flag and config.mode == "in-vivo":
             score -= 15
+        if config.mode == "in-vitro" and not c.protospacer.startswith("G"):
+            c.warnings.append(
+                "no 5' G: prepend a G to the protospacer for T7 transcription")
         if 40 <= c.gc_percent <= 65:
             score += 5
         elif c.gc_percent > 75:
@@ -320,7 +324,9 @@ def design_sgRNAs(cluster_seq: str,
                   upstream_seq: str,
                   downstream_seq: str,
                   genome_seq: Optional[str] = None,
-                  config: Optional[PipelineConfig] = None) -> dict:
+                  config: Optional[PipelineConfig] = None,
+                  upstream_start: int = 0,
+                  rejected_out: Optional[dict] = None) -> dict:
     """Design ranked sgRNAs for both ends of a BGC.
 
     Parameters
@@ -336,6 +342,14 @@ def design_sgRNAs(cluster_seq: str,
         upstream + cluster + downstream is used.
     config : PipelineConfig, optional
         Configuration overrides (defaults if omitted).
+    upstream_start : int
+        Coordinate, in ``genome_seq``, of the first base of ``upstream_seq``
+        (``cluster.start - len(upstream_seq)``). Cut positions are reported in
+        ``genome_seq`` coordinates, so this MUST be set whenever ``genome_seq``
+        is a larger sequence than upstream + cluster + downstream.
+    rejected_out : dict, optional
+        If given, filled with ``{"left": [...], "right": [...]}`` listing
+        candidates dropped for cleaving inside the BGC (with their sites).
 
     Returns
     -------
@@ -353,17 +367,49 @@ def design_sgRNAs(cluster_seq: str,
                                       config.protospacer_length)
 
     # Offset cut positions to be relative to genome_seq
-    upstream_offset = 0
-    downstream_offset = len(upstream_seq) + len(cluster_seq)
+    upstream_offset = upstream_start
+    cluster_start = upstream_start + len(upstream_seq)
+    cluster_end = cluster_start + len(cluster_seq)
+    downstream_offset = cluster_end
     left_candidates = _offset_candidates(left_candidates, upstream_offset)
     right_candidates = _offset_candidates(right_candidates, downstream_offset)
 
     left_ranked = rank_sgRNAs(left_candidates, genome_seq, config)
     right_ranked = rank_sgRNAs(right_candidates, genome_seq, config)
 
+    # Drop guides that would also cleave inside the BGC. One index over the
+    # local window (upstream + cluster + downstream) serves every candidate;
+    # pair-level checks over the full fragment happen later.
+    local = upstream_seq + cluster_seq + downstream_seq
+    idx = build_site_index(local, offset=upstream_start,
+                           protospacer_len=config.protospacer_length,
+                           seed_len=config.seed_length)
+    kept = {}
+    rejected = {"left": [], "right": []}
+    for side, ranked in (("left", left_ranked), ("right", right_ranked)):
+        kept[side] = []
+        for c in ranked:
+            sites = find_cut_sites(c.protospacer, idx, config.max_mismatches)
+            if side == "left":     # fragment starts at the cut: (cut, cluster_end]
+                inside = [x for x in sites if c.cut_position < x.cut_position <= cluster_end]
+            else:                  # fragment ends at the cut: [cluster_start, cut)
+                inside = [x for x in sites if cluster_start <= x.cut_position < c.cut_position]
+            high = [x for x in inside if x.severity == "high"]
+            if high and config.exclude_internal_cuts:
+                rejected[side].append((c, inside))
+                continue
+            c.internal_cuts = inside
+            for x in inside:
+                c.warnings.append(
+                    f"possible additional cut inside the BGC at {x.cut_position} "
+                    f"(PAM {x.pam}, {x.mismatches} mismatch(es), severity {x.severity})")
+            kept[side].append(c)
+    if rejected_out is not None:
+        rejected_out.update(rejected)
+
     return {
-        "left": left_ranked[:config.top_n_sgRNAs],
-        "right": right_ranked[:config.top_n_sgRNAs],
+        "left": kept["left"][:config.top_n_sgRNAs],
+        "right": kept["right"][:config.top_n_sgRNAs],
     }
 
 
@@ -372,15 +418,8 @@ def _offset_candidates(candidates: list[PAMCandidate],
     """Adjust position and cut_position of each candidate by offset."""
     adjusted = []
     for c in candidates:
-        adjusted.append(PAMCandidate(
-            position=c.position + offset,
-            strand=c.strand,
-            protospacer=c.protospacer,
-            pam=c.pam,
-            cut_position=c.cut_position + offset,
-            gc_percent=c.gc_percent,
-            polyt_flag=c.polyt_flag,
-        ))
+        adjusted.append(dataclasses.replace(
+            c, position=c.position + offset, cut_position=c.cut_position + offset))
     return adjusted
 
 

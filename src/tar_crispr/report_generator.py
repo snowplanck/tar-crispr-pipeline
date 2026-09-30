@@ -446,7 +446,8 @@ def generate_report(sgRNAs: dict,
                     config: PipelineConfig,
                     genome_stats: dict,
                     output_dir: str,
-                    selected_sgRNAs: Optional[dict] = None) -> str:
+                    selected_sgRNAs: Optional[dict] = None,
+                    cut_safety=None) -> str:
     """Generate the final report in Markdown format with embedded SVG.
 
     Parameters
@@ -471,6 +472,9 @@ def generate_report(sgRNAs: dict,
         Directory to write report files.
     selected_sgRNAs : dict, optional
         User-selected sgRNAs (overrides auto-selection).
+    cut_safety : PairReport, optional
+        Result of the Cas9 cut-site safety checks for the selected pair
+        (from ``cut_specificity``); adds a section to the report.
 
     Returns
     -------
@@ -538,6 +542,26 @@ def generate_report(sgRNAs: dict,
     md.append(f"\n### All Candidate sgRNAs\n")
     md.append(_format_sgRNA_table(sgRNAs))
     md.append("")
+
+    # Cas9 cut-site safety (mode-dependent)
+    md.append(f"### Cas9 cut-site safety (mode: `{config.mode}`)\n")
+    if cut_safety is None:
+        md.append("_Cut-site safety checks were not run._\n")
+    else:
+        md.append("**Result:** " + ("PASS — no unwanted high-confidence cut sites"
+                                    if cut_safety.ok else "FAIL — see issues below") + "\n")
+        for label, items in (("Issues", cut_safety.hard_issues),
+                             ("Warnings", cut_safety.warnings),
+                             ("Notes", cut_safety.notes)):
+            if items:
+                md.append(f"**{label}:**\n")
+                md.extend(f"- {i}" for i in items)
+                md.append("")
+    for name, g in (("Left", left_sg), ("Right", right_sg)):
+        if getattr(g, "warnings", None):
+            md.append(f"**{name} sgRNA notes:**\n")
+            md.extend(f"- {w}" for w in g.warnings)
+            md.append("")
 
     # Section 3: Fragment Definition
     md.append("## 3. Excised Fragment\n")

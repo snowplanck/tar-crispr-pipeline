@@ -22,6 +22,13 @@ class PipelineConfig:
     primer_anneal_max: int = 25
     max_mismatches: int = 3
     avoid_enzymes: list = field(default_factory=list)
+    # Cas9 delivery mode. "in-vitro": HMW genomic DNA is digested with
+    # Cas9/sgRNA RNP before transformation (vector never sees Cas9).
+    # "in-vivo": Cas9 is expressed in yeast, so the vector and the yeast
+    # genome are also potential cleavage targets.
+    mode: str = "in-vitro"
+    seed_length: int = 12
+    exclude_internal_cuts: bool = True
     blast_available: Optional[bool] = None
     rnafold_available: Optional[bool] = None
 
@@ -48,6 +55,21 @@ class PAMCandidate:
     cut_position: int
     gc_percent: float
     polyt_flag: bool
+    internal_cuts: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+
+@dataclass
+class CutSite:
+    """A position where a guide can plausibly direct Cas9 cleavage."""
+    cut_position: int          # 0-based boundary (same convention as PAMCandidate)
+    strand: str
+    pam: str
+    pam_class: str             # "NGG", "NAG" or "NGA"
+    mismatches: int            # total protospacer mismatches
+    seed_mismatches: int       # mismatches in the PAM-proximal seed
+    severity: str              # "high" or "medium"
+    locus: str = "fragment"    # "fragment", "vector" or "yeast"
+    site: str = ""             # genomic protospacer sequence at the site
 
 @dataclass
 class HomologyArm:
@@ -88,6 +110,7 @@ __all__ = [
     "PipelineConfig",
     "ClusterInfo",
     "PAMCandidate",
+    "CutSite",
     "HomologyArm",
     "TailedPrimer",
     "AssemblyResult",
