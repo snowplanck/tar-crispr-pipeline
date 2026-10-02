@@ -473,7 +473,8 @@ def generate_report(sgRNAs: dict,
                     output_dir: str,
                     selected_sgRNAs: Optional[dict] = None,
                     cut_safety=None,
-                    pair_ranking: Optional[list] = None) -> str:
+                    pair_ranking: Optional[list] = None,
+                    screening=None) -> str:
     """Generate the final report in Markdown format with embedded SVG.
 
     Parameters
@@ -504,6 +505,9 @@ def generate_report(sgRNAs: dict,
     pair_ranking : list, optional
         Ranked ``PairCandidate`` objects (from ``pair_ranking.rank_pairs``);
         adds the pair-ranking table and the score breakdown of the pair in use.
+    screening : ScreeningDesign, optional
+        Colony-PCR screening panel (from ``screening.design_screening``); adds
+        section 7 and writes ``screening_primers.csv``.
 
     Returns
     -------
@@ -659,6 +663,48 @@ def generate_report(sgRNAs: dict,
     else:
         md.append(f"\nNo issues detected. Assembly verified.")
     md.append("")
+
+    # Section 6.1: Colony-PCR screening panel (designed on the assembled construct)
+    if screening is not None and (screening.amplicons or screening.failed or screening.notes):
+        from tar_crispr.screening import export_screening
+        md.append("### 6.1 Colony-PCR Screening Panel\n")
+        md.append("Primers placed on the assembled construct to screen yeast (or E. coli) "
+                  "colonies. Junction amplicons only appear when the vector is joined to the "
+                  "BGC end; the empty re-circularised vector gives no junction band. Each "
+                  "amplicon has a distinct size so the panel can be read from one gel. "
+                  f"Construct: {screening.construct_length} bp; left junction at position "
+                  f"{screening.left_junction + 1}, right junction at {screening.right_junction + 1}. "
+                  "Tm: primer3 nearest-neighbour, 50 mM Na+, 1.5 mM Mg2+, 0.6 mM dNTP, 50 nM primer.\n")
+        if screening.amplicons:
+            md.append("| Amplicon | Role | Product (bp) | Forward primer (5'→3') | Tm F | "
+                      "Reverse primer (5'→3') | Tm R | Notes |")
+            md.append("|----------|------|--------------|------------------------|------|"
+                      "------------------------|------|-------|")
+            for a in screening.amplicons:
+                notes = "; ".join(a.issues + a.warnings) or "—"
+                md.append(f"| {a.name} | {a.role} | {a.product_size} | `{a.forward.sequence}` | "
+                          f"{a.forward.tm} | `{a.reverse.sequence}` | {a.reverse.tm} | {notes} |")
+            md.append("")
+            md.append("**Targets:**\n")
+            for a in screening.amplicons:
+                md.append(f"- **{a.name}** ({a.role}): {a.target}")
+            md.append("")
+            md.append("**Expected result:** correct clone = all bands above; empty vector = "
+                      "no band in any lane except vector-only controls; partial insert = junction "
+                      "bands present but one or more interior bands missing. Confirm positive "
+                      "clones by sequencing across both junctions (the junction primers can be "
+                      "used for this).\n")
+        if screening.failed:
+            md.append("**Could not be designed:**\n")
+            md.extend(f"- {f}" for f in screening.failed)
+            md.append("")
+        if screening.notes:
+            md.append("**Notes:**\n")
+            md.extend(f"- {n}" for n in screening.notes)
+            md.append("")
+        if screening.amplicons:
+            export_screening(screening, os.path.join(output_dir, "screening_primers.csv"))
+            md.append("**Screening primer CSV exported to:** `screening_primers.csv`\n")
 
     # Section 7: Visualization
     md.append("## 7. BGC Schematic Map\n")

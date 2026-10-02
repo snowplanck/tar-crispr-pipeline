@@ -119,6 +119,10 @@ Options:
   --yeast-genome PATH  S. cerevisiae genome FASTA for the host off-target check (in-vivo)
   --specificity-model  sgRNA off-target model: mit (default) or legacy
   --n-pairs            Best guide pairs for which homology arms are evaluated (default: 5)
+  --screening/--no-screening  Colony-PCR screening primers on the final construct (default: on)
+  --marker-keyword TEXT  CDS annotation text selecting the marker gene (repeatable, priority order)
+  --screening-spaced   Integrity amplicons spread along the BGC (default: 2)
+  --absolute-arm-gc    Fixed arm GC limits (65%/75%) instead of limits relative to the fragment GC
   --allow-internal-cuts  Keep sgRNAs that also cut inside the BGC (reported as warnings)
   --verbose            Verbose output
 ```
@@ -211,6 +215,18 @@ Each candidate guide gets a genome-wide **specificity score (0–100)** in the s
 The left and right guides are then ranked **as pairs** (they define one fragment): score = weakest guide's specificity − penalties for guide quality (mode-aware), extra flanking DNA, medium-confidence cut sites, and — for the `--n-pairs` best pairs — homology-arm problems (non-unique arms, structure, arms shifted inward so end bases of the BGC are not captured). Pairs with a high-confidence cut site inside the fragment are excluded. The report lists the ranking and the score breakdown of the pair used.
 
 Not modelled: on-target cleavage efficiency (e.g. Doench Rule Set 2). The score ranks specificity and practical design constraints only.
+
+## Colony-PCR screening primers
+
+After TAR cloning most yeast colonies carry the empty vector or a partial insert, so the pipeline designs a screening panel on the *assembled construct* (section 6.1 of the report, `screening_primers.csv`):
+
+- **Junction amplicons (JL, JR):** one primer in the vector backbone and one inside the BGC fragment, so the band appears only when the vector is joined to that BGC end. The empty re-circularised vector gives no band.
+- **Marker gene (MK):** an amplicon inside a core biosynthetic gene. The gene is found in the GenBank annotation of the BGC (`--genbank`) by searching CDS product/gene/`gene_functions`/`sec_met_domain`/note text for `t2pks`, `ketosynthase`, `chain length factor`, `ketoacyl synthase` or `polyketide synthase`, in that priority order; override with `--marker-keyword`. The report names the CDS that was chosen: check it is the gene you want (primary-metabolism FabF-like synthases can match "ketoacyl synthase"). Without a match or without annotation, spaced amplicons are used instead.
+- **Integrity amplicons (IN1…):** spread along the BGC to catch deletions and partial captures that keep both junctions.
+
+Every amplicon gets a different product size (300–450, 500–650, 700–850 bp, …) so the panel can be read from one gel. Pairs come from primer3 (Tm 58–62 °C by default, same conditions as the other primers) and are checked by an in-silico PCR on the construct (the intended product must be the only one for that pair), against an optional host genome (`--yeast-genome`, one primer-site and product check) and for cross-dimers with the primers already chosen. Cross-pair products near the intended sizes are reported if all primers are put in one tube. The specificity checks use a simple model (exact 3' 10-mer, at most 3 mismatches), not a thermodynamic one; confirm by sequencing across both junctions with the junction primers.
+
+Homology-arm GC limits are now relative to the fragment's own GC: the absolute limits (65% ideal, 75% warning) are the floor, and for a high-GC fragment they become GC + 5 and GC + 10 points (a ~72% GC *Streptomyces* fragment: 77% and 82%). Use `--absolute-arm-gc` for the old behaviour.
 
 ## Output Files
 

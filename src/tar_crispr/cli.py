@@ -20,6 +20,7 @@ from tar_crispr.pam_finder import design_sgRNAs, find_pam_sites, rank_sgRNAs
 from tar_crispr.fragment_ends import extract_fragment
 from tar_crispr.cut_specificity import build_index_from_fasta
 from tar_crispr.pair_ranking import rank_pairs, best_pair
+from tar_crispr.screening import design_screening
 from tar_crispr.homology_arms import design_homology_arms
 from tar_crispr.primer_design import design_tailed_primers
 from tar_crispr.assembly_sim import simulate_pydna_assembly
@@ -70,6 +71,18 @@ def run(
     specificity_model: str = typer.Option("mit", "--specificity-model",
                                            help="sgRNA off-target model: 'mit' (genome-wide, position-weighted "
                                                 "score, default) or 'legacy' (plain count of look-alike sites)"),
+    screening: bool = typer.Option(True, "--screening/--no-screening",
+                                   help="Design colony-PCR screening primers (junctions, marker gene, "
+                                        "integrity amplicons) on the assembled construct"),
+    marker_keywords: Optional[List[str]] = typer.Option(
+        None, "--marker-keyword",
+        help="Text searched in CDS annotations to pick the marker gene (repeatable, in priority "
+             "order; default: type II PKS KS/CLF terms). Needs a GenBank BGC (--genbank)"),
+    screening_spaced: int = typer.Option(2, "--screening-spaced",
+                                         help="Integrity amplicons spread along the BGC"),
+    absolute_arm_gc: bool = typer.Option(False, "--absolute-arm-gc",
+                                         help="Use the fixed arm GC limits (65%/75%) instead of limits "
+                                              "relative to the fragment's GC"),
     n_pairs: int = typer.Option(5, "--n-pairs",
                                 help="Minimum number of guide pairs whose homology arms are evaluated (more are "
                                      "evaluated if needed to prove the best pair)"),
@@ -86,6 +99,9 @@ def run(
         mode=mode,
         specificity_model=specificity_model,
         n_pairs=max(1, n_pairs),
+        relative_arm_gc=not absolute_arm_gc,
+        screening=screening,
+        screening_n_spaced=max(0, screening_spaced),
         exclude_internal_cuts=not allow_internal_cuts,
         pam_window=pam_window,
         top_n_sgRNAs=top_n,
@@ -369,6 +385,28 @@ def run(
     _log(f"Assembly {'passed' if assembly_result.success else 'FAILED'}: "
          f"{assembly_result.final_size} bp, circular={assembly_result.circular}", verbose)
 
+    # Step 6b: colony-PCR screening primers on the assembled construct
+    screening_design = None
+    if config.screening:
+        if marker_keywords:
+            config.screening_marker_keywords = list(marker_keywords)
+        if not assembly_result.final_sequence:
+            _log("WARNING: no assembled construct; screening primers skipped", verbose)
+        else:
+            _log("Step 6b: Designing colony-PCR screening primers...", verbose)
+            host_seq = None
+            if yeast_genome:
+                from Bio import SeqIO
+                host_seq = "".join(str(r.seq) for r in SeqIO.parse(yeast_genome, "fasta"))
+            screening_design = design_screening(
+                assembly_result.final_sequence, vector_cut_left, len(fragment.sequence),
+                fragment_seq=fragment.sequence, bgc_record=bgc_record,
+                config=config, host_seq=host_seq)
+            _log(f"Screening panel: {len(screening_design.amplicons)} amplicon(s), "
+                 f"sizes {[a.product_size for a in screening_design.amplicons]}", verbose)
+            for f in screening_design.failed:
+                _log(f"WARNING: screening amplicon not designed: {f}", verbose)
+
     # Step 7: Generate report
     _log("Step 7: Generating report...", verbose)
     Path(output).mkdir(parents=True, exist_ok=True)
@@ -385,6 +423,7 @@ def run(
         selected_sgRNAs=selected,
         cut_safety=cut_report,
         pair_ranking=pairs,
+        screening=screening_design,
     )
 
     # Optional: render a circular map of the final construct.

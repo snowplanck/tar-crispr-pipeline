@@ -34,6 +34,22 @@ class PipelineConfig:
     specificity_model: str = "mit"
     n_pairs: int = 5          # guide pairs for which homology arms are evaluated
     min_specificity: float = 50.0   # warn below this guide specificity (0-100)
+    # Homology-arm GC limits relative to the fragment's own GC. A fixed 65%
+    # ceiling flags nearly every arm of a ~72% GC Streptomyces genome, which
+    # makes the penalty meaningless. With relative_arm_gc the limits become
+    # max(absolute limit, fragment GC + margin); the absolute limits remain the
+    # floor, so low-GC genomes behave exactly as before.
+    relative_arm_gc: bool = True
+    arm_gc_soft_margin: float = 5.0     # percentage points above fragment GC
+    arm_gc_hard_margin: float = 10.0
+    # Colony-PCR screening primers (junctions + internal markers)
+    screening: bool = True
+    # Priority-ordered substrings searched in CDS qualifiers to pick the marker
+    # gene (type II PKS KS/CLF by default). Override with --marker-keyword.
+    screening_marker_keywords: list = field(default_factory=lambda: [
+        "t2pks", "ketosynthase", "chain length factor", "chain-length factor",
+        "ketoacyl synthase", "polyketide synthase"])
+    screening_n_spaced: int = 2      # integrity amplicons spread along the BGC
     blast_available: Optional[bool] = None
     rnafold_available: Optional[bool] = None
 
@@ -108,6 +124,47 @@ class TailedPrimer:
     valid: bool = True
 
 @dataclass
+class ScreeningPrimer:
+    """A colony-PCR primer placed on the assembled construct."""
+    name: str
+    sequence: str            # 5'->3'
+    strand: str              # "+" forward, "-" reverse
+    start: int               # 0-based, half-open, construct (forward) coordinates
+    end: int
+    tm: float
+    gc_percent: float
+    length: int
+
+
+@dataclass
+class ScreeningAmplicon:
+    """One screening PCR: a primer pair and the product it must give."""
+    name: str
+    role: str                # junction-left | junction-right | marker-gene | integrity
+    target: str              # human-readable description
+    forward: ScreeningPrimer
+    reverse: ScreeningPrimer
+    product_size: int
+    start: int
+    end: int
+    level: str = "strict"    # which primer-design relaxation level was needed
+    issues: list = field(default_factory=list)      # problems selection tried to avoid
+    warnings: list = field(default_factory=list)
+
+
+@dataclass
+class ScreeningDesign:
+    amplicons: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+    construct_length: int = 0
+    left_junction: int = 0
+    right_junction: int = 0
+    marker: Optional[dict] = None
+    multiplex_products: list = field(default_factory=list)
+    failed: list = field(default_factory=list)       # amplicons that could not be designed
+
+
+@dataclass
 class AssemblyResult:
     success: bool
     final_size: int
@@ -123,4 +180,7 @@ __all__ = [
     "HomologyArm",
     "TailedPrimer",
     "AssemblyResult",
+    "ScreeningPrimer",
+    "ScreeningAmplicon",
+    "ScreeningDesign",
 ]
