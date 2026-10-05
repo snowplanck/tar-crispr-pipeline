@@ -235,6 +235,46 @@ class TestMarkerGene:
         assert [a.role for a in d.amplicons].count("integrity") == 2
 
 
+class TestAntismashDefaultKeywords:
+    """Default keywords must pick the core KS gene, not tailoring genes tagged t2pks."""
+    KS = "ATG" + rnd(1200, 81, gc=True) + "TGA"
+
+    def _record(self, ks_functions):
+        tailoring = "ATG" + rnd(900, 82, gc=True) + "TGA"
+        tail2 = "ATG" + rnd(900, 83, gc=True) + "TGA"
+        # tailoring genes sit at the centre, the KS gene is off-centre
+        seq = rnd(500, 84) + self.KS + rnd(3000, 85) + tailoring + rnd(300, 86) + tail2 + rnd(3000, 87)
+        ks0 = 500
+        t0 = ks0 + len(self.KS) + 3000
+        t1 = t0 + len(tailoring) + 300
+        mk = lambda a, n, tag, fn: SeqFeature(FeatureLocation(a, a + n, strand=1), type="CDS", qualifiers={
+            "locus_tag": [tag], "gene_functions": [fn], "gene_kind": ["biosynthetic-additional"]})
+        feats = [
+            SeqFeature(FeatureLocation(ks0, ks0 + len(self.KS), strand=1), type="CDS", qualifiers={
+                "locus_tag": ["KS_CORE"], "gene_functions": [ks_functions], "gene_kind": ["biosynthetic"]}),
+            mk(t0, len(tailoring), "TAIL_KR", "biosynthetic-additional (t2pks) KR (Score: 120.1; E-value: 1e-30)"),
+            mk(t1, len(tail2), "TAIL_OXY", "biosynthetic-additional (t2pks) OXY (Score: 99.0; E-value: 1e-25)"),
+        ]
+        return SeqRecord(Seq(seq), id="bgc", features=feats), seq
+
+    def test_ketoacyl_synt_term_selects_ks_over_t2pks_tailoring(self):
+        rec, frag = self._record("biosynthetic (rule-based-clusters) T2PKS: ... "
+                                 "(rule-based-clusters) ketoacyl-synt")
+        m = find_marker_gene(rec, frag, PipelineConfig().screening_marker_keywords)
+        assert m["name"] == "KS_CORE" and m["keyword"] == "ketoacyl-synt"
+
+    def test_core_gene_label_is_the_fallback_and_still_avoids_tailoring_genes(self):
+        rec, frag = self._record("biosynthetic (rule-based-clusters) T2PKS: some core hit")
+        m = find_marker_gene(rec, frag, PipelineConfig().screening_marker_keywords)
+        assert m["name"] == "KS_CORE" and m["keyword"] == "biosynthetic (rule-based-clusters)"
+
+    def test_bare_t2pks_is_not_a_default_keyword(self):
+        assert "t2pks" not in PipelineConfig().screening_marker_keywords
+        rec, frag = self._record("biosynthetic (rule-based-clusters) T2PKS: core")
+        old = find_marker_gene(rec, frag, ["t2pks"])               # what the old default did
+        assert old["name"] != "KS_CORE"                            # it picked a tailoring gene
+
+
 # ------------------------------------------------------------ export
 def test_csv_export(construct, tmp_path):
     d = design_screening(construct["seq"], construct["JL"], len(construct["frag"]),
@@ -324,3 +364,111 @@ class TestCli:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "Colony-PCR Screening Panel" not in (out / "report.md").read_text()
         assert not (out / "screening_primers.csv").exists()
+
+
+# ------------------------------------------------------------ antiSMASH-style annotation
+def _antismash_record_evidence():
+    """KS core gene (at the left end) tagged '(rule-based-clusters) ... ketoacyl-synt'; tailoring
+    genes tagged 'biosynthetic-additional (t2pks) ...' sit closer to the BGC centre."""
+    def gene(n, seed):
+        return "ATG" + rnd(n, seed, gc=True) + "TGA"
+    g_oxy1, g_ks, g_oxy2, g_met = gene(900, 1), gene(1200, 2), gene(900, 3), gene(900, 4)
+    seq, feats, pos = "", [], 0
+    for locus, g, funcs in [
+        ("KSA", g_ks, "biosynthetic (rule-based-clusters) T2PKS: (rule-based-clusters) ketoacyl-synt"),
+        ("OXY1", g_oxy1, "biosynthetic-additional (t2pks) OXY (Score: 200.1; E-value: 1e-60)"),
+        ("OXY2", g_oxy2, "biosynthetic-additional (t2pks) OXY (Score: 150.0; E-value: 1e-40)"),
+        ("MET1", g_met, "biosynthetic-additional (t2pks) MET (Score: 120.0; E-value: 1e-30)"),
+    ]:
+        seq += rnd(400, 90 + pos, gc=True)
+        feats.append(SeqFeature(FeatureLocation(len(seq), len(seq) + len(g), strand=1), type="CDS",
+                                qualifiers={"locus_tag": [locus], "gene_functions": [funcs],
+                                            "product": ["hypothetical protein"]}))
+        seq += g
+        pos += 1
+    seq += rnd(400, 99, gc=True)
+    return SeqRecord(Seq(seq), id="bgc", features=feats), seq
+
+
+class TestAntismashEvidence:
+    def test_defaults_pick_core_ks_not_tailoring_genes(self):
+        rec, frag = _antismash_record_evidence()
+        centre = len(frag) / 2
+        dist = {f.qualifiers["locus_tag"][0]: abs((f.location.start + f.location.end) / 2 - centre)
+                for f in rec.features}
+        assert dist["OXY1"] < dist["KSA"]          # premise: a tailoring gene is nearer the centre
+        m = find_marker_gene(rec, frag, PipelineConfig().screening_marker_keywords)
+        assert m["name"] == "KSA"
+        assert m["keyword"] == "ketoacyl-synt"
+        assert "ketoacyl-synt" in m["evidence"].lower()
+
+    def test_bare_t2pks_would_have_picked_a_tailoring_gene(self):
+        rec, frag = _antismash_record_evidence()
+        m = find_marker_gene(rec, frag, ["t2pks"])
+        assert m["name"] != "KSA" and m["n_matches"] >= 3          # documents why it is not a default
+
+    def test_bare_t2pks_is_not_a_default_keyword(self):
+        assert "t2pks" not in PipelineConfig().screening_marker_keywords
+
+    def test_core_rule_tag_alone_still_matches_core_gene(self):
+        rec, frag = _antismash_record_evidence()
+        m = find_marker_gene(rec, frag, ["(rule-based-clusters) t2pks"])
+        assert m["name"] == "KSA"
+
+    def test_design_reports_evidence_and_match_count(self):
+        rec, frag = _antismash_record_evidence()
+        v5, v3 = rnd(3000, 71), rnd(2500, 72)
+        d = design_screening(v5 + frag + v3, len(v5), len(frag), fragment_seq=frag,
+                             bgc_record=rec, config=PipelineConfig(screening_marker_keywords=["t2pks"]))
+        mk = [a for a in d.amplicons if a.role == "marker-gene"]
+        assert mk and "matched 't2pks'" in mk[0].target
+        assert any("matched" in n and "Check it is the gene" in n for n in d.notes)
+
+
+# ------------------------------------------------------------ antiSMASH-style annotation
+def _antismash_record_separators():
+    """Tailoring gene nearest the centre; core KS and CLF genes off-centre (antiSMASH wording)."""
+    kg, cg, og = ("ATG" + rnd(1200, 81, gc=True) + "TGA", "ATG" + rnd(1100, 82, gc=True) + "TGA",
+                  "ATG" + rnd(1000, 83, gc=True) + "TGA")
+    spacer = lambda i: rnd(400, 90 + i, gc=True)
+    seq = spacer(0) + kg + spacer(1) + cg + spacer(2) + og + spacer(3) + rnd(3000, 99, gc=True)
+    pos, feats = 400, []
+    for name, gene, q in (
+        ("KSA", kg, {"gene_functions": ["biosynthetic (rule-based-clusters) T2PKS: ketoacyl-synt "
+                                        "(Score: 500.1; E-value: 1e-150)"],
+                     "sec_met_domain": ["ketoacyl-synt (E-value: 1e-120, bitscore: 300.0)"]}),
+        ("CLF", cg, {"gene_functions": ["biosynthetic (rule-based-clusters) T2PKS: "
+                                        "Chain_length_factor (Score: 300.0)"]}),
+        ("OXY", og, {"gene_functions": ["biosynthetic-additional (t2pks) OXY (Score: 100.0)"]}),
+    ):
+        feats.append(SeqFeature(FeatureLocation(pos, pos + len(gene), strand=1), type="CDS",
+                                qualifiers={"locus_tag": [name], "product": ["hypothetical protein"], **q}))
+        pos += len(gene) + 400
+    return SeqRecord(Seq(seq), id="bgc", features=feats), str(seq)
+
+
+class TestAntismashSeparators:
+    def test_default_keywords_pick_core_ks_not_a_tailoring_gene(self):
+        rec, frag = _antismash_record_separators()
+        # the tailoring gene (OXY) is the CDS nearest the fragment centre
+        centre = len(frag) / 2
+        oxy = next(f for f in rec.features if f.qualifiers["locus_tag"][0] == "OXY")
+        ks = next(f for f in rec.features if f.qualifiers["locus_tag"][0] == "KSA")
+        assert abs((oxy.location.start + oxy.location.end) / 2 - centre) < \
+            abs((ks.location.start + ks.location.end) / 2 - centre)
+        m = find_marker_gene(rec, frag, PipelineConfig().screening_marker_keywords)
+        assert m is not None and m["name"] == "KSA"
+
+    def test_tailoring_only_annotation_gives_no_marker(self):
+        rec, frag = _antismash_record_separators()
+        rec.features = [f for f in rec.features if f.qualifiers["locus_tag"][0] == "OXY"]
+        assert find_marker_gene(rec, frag, PipelineConfig().screening_marker_keywords) is None
+
+    def test_underscores_hyphens_and_case_are_equivalent(self):
+        rec, frag = _antismash_record_separators()
+        assert find_marker_gene(rec, frag, ["CHAIN-LENGTH_factor"])["name"] == "CLF"
+
+    def test_marker_reports_its_evidence(self):
+        rec, frag = _antismash_record_separators()
+        m = find_marker_gene(rec, frag, PipelineConfig().screening_marker_keywords)
+        assert m["n_matches"] >= 1 and "ketoacyl" in m["evidence"].lower()

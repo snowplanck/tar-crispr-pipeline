@@ -402,6 +402,10 @@ def run(
                 assembly_result.final_sequence, vector_cut_left, len(fragment.sequence),
                 fragment_seq=fragment.sequence, bgc_record=bgc_record,
                 config=config, host_seq=host_seq)
+            if screening_design.marker:
+                m = screening_design.marker
+                _log(f"Marker gene: {m['name']} ({m['product'] or m['keyword']}), matched keyword "
+                     f"'{m['keyword']}'", verbose)
             _log(f"Screening panel: {len(screening_design.amplicons)} amplicon(s), "
                  f"sizes {[a.product_size for a in screening_design.amplicons]}", verbose)
             for f in screening_design.failed:

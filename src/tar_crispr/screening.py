@@ -185,10 +185,25 @@ def predict_amplicons(primers: dict, seq: str, circular: bool = True,
 # Marker gene (from the BGC annotation)
 # --------------------------------------------------------------------------
 def _feature_text(feature) -> str:
+    """Searchable annotation text of a feature (original case; lower() it to search)."""
     parts = []
     for key in ("product", "gene", "gene_functions", "sec_met_domain", "note", "function"):
         parts.extend(str(v) for v in feature.qualifiers.get(key, []))
-    return " ".join(parts).lower()
+    return re.sub(r"\s+", " ", " ".join(parts))
+
+
+def _kw_regex(keyword: str):
+    """Regex matching *keyword* ignoring case and treating ``-``, ``_`` and spaces alike.
+
+    antiSMASH writes the same domain as ``Chain_length_factor``, ``chain-length-factor``
+    or ``chain length factor`` depending on the field, so all three must match. Matching
+    on the original text (rather than a normalised copy) lets the report quote the
+    annotation exactly as it appears.
+    """
+    tokens = [t for t in re.split(r"[\s_\-]+", keyword.strip()) if t]
+    if not tokens:
+        return None
+    return re.compile(r"[\s_\-]+".join(re.escape(t) for t in tokens), re.IGNORECASE)
 
 
 def find_marker_gene(bgc_record, fragment_seq: str, keywords: list) -> Optional[dict]:
@@ -207,11 +222,15 @@ def find_marker_gene(bgc_record, fragment_seq: str, keywords: list) -> Optional[
     centre = len(fragment) / 2
     cds = [f for f in bgc_record.features if f.type == "CDS"]
     for kw in keywords:
+        rx = _kw_regex(kw)
         kw = kw.lower()
         hits = []
         for f in cds:
-            if kw not in _feature_text(f):
+            text = _feature_text(f)
+            m_kw = rx.search(text) if rx else None
+            if m_kw is None:
                 continue
+            at, kw_len = m_kw.start(), m_kw.end() - m_kw.start()
             try:
                 gene = _clean(str(f.extract(bgc_record.seq)))
             except Exception:
@@ -228,10 +247,14 @@ def find_marker_gene(bgc_record, fragment_seq: str, keywords: list) -> Optional[
             name = (f.qualifiers.get("locus_tag") or f.qualifiers.get("gene")
                     or f.qualifiers.get("protein_id") or ["CDS"])[0]
             product = (f.qualifiers.get("product") or [""])[0]
+            evidence = text[max(0, at - 30): at + kw_len + 50].strip()
             hits.append({"name": str(name), "product": str(product), "keyword": kw,
+                         "evidence": evidence,
                          "start": pos, "end": pos + len(gene), "strand": strand})
         if hits:
-            return min(hits, key=lambda h: abs((h["start"] + h["end"]) / 2 - centre))
+            best = min(hits, key=lambda h: abs((h["start"] + h["end"]) / 2 - centre))
+            best["n_matches"] = len(hits)
+            return best
     return None
 
 
@@ -461,9 +484,14 @@ def design_screening(construct: str, left_junction: int, fragment_len: int,
     if marker:
         design.marker = marker
         gs, ge = JL + marker["start"], JL + marker["end"]
+        if marker.get("n_matches", 1) > 1:
+            design.notes.append(
+                f"keyword '{marker['keyword']}' matched {marker['n_matches']} CDS; "
+                f"{marker['name']} (nearest the BGC centre) was used. Check it is the gene you "
+                "want, or narrow it with --marker-keyword")
         amp = run("MK", "marker-gene",
                   f"{marker['name']} ({marker['product'] or marker['keyword']}) at construct "
-                  f"{gs + 1}-{ge}",
+                  f"{gs + 1}-{ge}; matched '{marker['keyword']}' in: \"{marker.get('evidence', '')}\"",
                   (gs - 150, ge + 150), (gs, ge - 60), (gs + 60, ge + 60))
         marker_ok = amp is not None
         if not marker_ok:

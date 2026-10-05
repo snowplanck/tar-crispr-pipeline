@@ -45,10 +45,13 @@ class PipelineConfig:
     # Colony-PCR screening primers (junctions + internal markers)
     screening: bool = True
     # Priority-ordered substrings searched in CDS qualifiers to pick the marker
-    # gene (type II PKS KS/CLF by default). Override with --marker-keyword.
+    # gene. Specific KS/CLF terms come first; the antiSMASH core-gene label
+    # "biosynthetic (rule-based-clusters)" is the last resort. A bare "t2pks"
+    # must NOT be used: antiSMASH also writes it on tailoring genes
+    # ("biosynthetic-additional (t2pks) KR/OXY/..."). Override with --marker-keyword.
     screening_marker_keywords: list = field(default_factory=lambda: [
-        "t2pks", "ketosynthase", "chain length factor", "chain-length factor",
-        "ketoacyl synthase", "polyketide synthase"])
+        "ketoacyl-synt", "ketosynthase", "chain length factor", "chain-length factor",
+        "ketoacyl synthase", "polyketide synthase", "biosynthetic (rule-based-clusters)"])
     screening_n_spaced: int = 2      # integrity amplicons spread along the BGC
     blast_available: Optional[bool] = None
     rnafold_available: Optional[bool] = None
