@@ -53,6 +53,10 @@ class PipelineConfig:
         "ketoacyl-synt", "ketosynthase", "chain length factor", "chain-length factor",
         "ketoacyl synthase", "polyketide synthase", "biosynthetic (rule-based-clusters)"])
     screening_n_spaced: int = 2      # integrity amplicons spread along the BGC
+    # Pin the marker gene by locus_tag / gene / protein_id instead of searching keywords.
+    screening_marker_gene: Optional[str] = None
+    # Note (not an error) when the BGC has a stretch longer than this without an interior amplicon.
+    screening_max_gap_bp: int = 12000
     blast_available: Optional[bool] = None
     rnafold_available: Optional[bool] = None
 
@@ -165,6 +169,10 @@ class ScreeningDesign:
     marker: Optional[dict] = None
     multiplex_products: list = field(default_factory=list)
     failed: list = field(default_factory=list)       # amplicons that could not be designed
+    # Coverage of the BGC by interior amplicons (fragment coordinates, 0 = left end)
+    coverage_gaps: list = field(default_factory=list)   # (start, end) between neighbouring amplicons
+    max_gap_bp: int = 0
+    max_gap_span: Optional[tuple] = None
 
 
 @dataclass

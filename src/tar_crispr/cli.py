@@ -78,6 +78,10 @@ def run(
         None, "--marker-keyword",
         help="Text searched in CDS annotations to pick the marker gene (repeatable, in priority "
              "order; default: type II PKS KS/CLF terms). Needs a GenBank BGC (--genbank)"),
+    marker_gene: Optional[str] = typer.Option(
+        None, "--marker-gene",
+        help="Pin the marker gene by locus_tag / gene / protein_id (case-insensitive) instead of "
+             "searching keywords. Needs a GenBank BGC (--genbank); fails if the gene is not found"),
     screening_spaced: int = typer.Option(2, "--screening-spaced",
                                          help="Integrity amplicons spread along the BGC"),
     absolute_arm_gc: bool = typer.Option(False, "--absolute-arm-gc",
@@ -102,6 +106,7 @@ def run(
         relative_arm_gc=not absolute_arm_gc,
         screening=screening,
         screening_n_spaced=max(0, screening_spaced),
+        screening_marker_gene=marker_gene,
         exclude_internal_cuts=not allow_internal_cuts,
         pam_window=pam_window,
         top_n_sgRNAs=top_n,
@@ -398,14 +403,22 @@ def run(
             if yeast_genome:
                 from Bio import SeqIO
                 host_seq = "".join(str(r.seq) for r in SeqIO.parse(yeast_genome, "fasta"))
-            screening_design = design_screening(
-                assembly_result.final_sequence, vector_cut_left, len(fragment.sequence),
-                fragment_seq=fragment.sequence, bgc_record=bgc_record,
-                config=config, host_seq=host_seq)
+            try:
+                screening_design = design_screening(
+                    assembly_result.final_sequence, vector_cut_left, len(fragment.sequence),
+                    fragment_seq=fragment.sequence, bgc_record=bgc_record,
+                    config=config, host_seq=host_seq)
+            except ValueError as e:
+                sys.exit(f"ERROR: {e}")
             if screening_design.marker:
                 m = screening_design.marker
                 _log(f"Marker gene: {m['name']} ({m['product'] or m['keyword']}), matched keyword "
                      f"'{m['keyword']}'", verbose)
+            if screening_design.max_gap_bp:
+                a0, b0 = screening_design.max_gap_span
+                _log(f"Interior coverage: longest stretch without an amplicon "
+                     f"{screening_design.max_gap_bp / 1000:.1f} kb ({a0 / 1000:.1f}-{b0 / 1000:.1f} kb)",
+                     verbose)
             _log(f"Screening panel: {len(screening_design.amplicons)} amplicon(s), "
                  f"sizes {[a.product_size for a in screening_design.amplicons]}", verbose)
             for f in screening_design.failed:

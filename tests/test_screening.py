@@ -422,7 +422,7 @@ class TestAntismashEvidence:
                              bgc_record=rec, config=PipelineConfig(screening_marker_keywords=["t2pks"]))
         mk = [a for a in d.amplicons if a.role == "marker-gene"]
         assert mk and "matched 't2pks'" in mk[0].target
-        assert any("matched" in n and "Check it is the gene" in n for n in d.notes)
+        assert any("matched" in n and "Other candidates" in n and "--marker-gene" in n for n in d.notes)
 
 
 # ------------------------------------------------------------ antiSMASH-style annotation
@@ -472,3 +472,244 @@ class TestAntismashSeparators:
         rec, frag = _antismash_record_separators()
         m = find_marker_gene(rec, frag, PipelineConfig().screening_marker_keywords)
         assert m["n_matches"] >= 1 and "ketoacyl" in m["evidence"].lower()
+
+
+# ============================================================ patch 0005
+from tar_crispr.screening import MIN_PRODUCT_SEPARATION, _allocate_centres, size_slot  # noqa: E402
+
+
+class TestProductSeparation:
+    def test_slots_are_100bp_wide_and_150bp_apart(self):
+        for i in range(12):
+            lo, hi = size_slot(i)
+            nlo, _ = size_slot(i + 1)
+            assert hi - lo == 100 and nlo - hi == 150          # literal values on purpose
+
+    def test_ladder_matches_slots(self):
+        assert SIZE_LADDER == [size_slot(i) for i in range(len(SIZE_LADDER))]
+
+    @pytest.mark.parametrize("seed,n_spaced", [(i, (1, 2, 3, 4, 2, 0)[i % 6]) for i in range(1, 19)])
+    def test_every_pair_of_products_differs_by_at_least_150bp(self, seed, n_spaced):
+        v5, v3, frag = rnd(3000, 100 + seed), rnd(2500, 200 + seed), rnd(30000, 300 + seed, gc=True)
+        d = design_screening(v5 + frag + v3, len(v5), len(frag), fragment_seq=frag,
+                             config=PipelineConfig(screening_n_spaced=n_spaced))
+        sizes = sorted(a.product_size for a in d.amplicons)
+        assert len(sizes) >= 3
+        # literal 150 on purpose: independent of the constant under test
+        assert all(b - a >= 150 for a, b in zip(sizes, sizes[1:])), sizes
+
+    def test_regression_old_ladder_allowed_92bp_gap(self):
+        # the previous ladder (300-450, 500-650) could give 447 and 539 (92 bp apart)
+        assert 539 - 447 < MIN_PRODUCT_SEPARATION
+        s0, s1 = size_slot(0), size_slot(1)
+        assert s1[0] - s0[1] >= 150
+
+
+class TestAllocateCentres:
+    def test_without_fixed_points_is_even_spacing(self):
+        assert _allocate_centres(40000, 3) == [10000, 20000, 30000]
+        assert _allocate_centres(40000, 1) == [20000]
+
+    def test_marker_position_reduces_the_longest_gap(self):
+        L, m = 37800, 27460                       # geometry of the real BGC: marker at ~27 kb
+        new = _allocate_centres(L, 2, [m])
+        pts = [0] + sorted(new + [m]) + [L]
+        new_gap = max(b - a for a, b in zip(pts, pts[1:]))
+        old = [int(L * i / 3) for i in (1, 2)]    # the previous even placement ignoring the marker
+        pts_old = [0] + sorted(old + [m]) + [L]
+        old_gap = max(b - a for a, b in zip(pts_old, pts_old[1:]))
+        assert new_gap < old_gap and new_gap <= 10400
+        assert new == sorted(new)
+
+    def test_is_optimal_for_small_cases_by_brute_force(self):
+        import itertools
+        L, m, n = 30000, 22000, 2
+        got = _allocate_centres(L, n, [m], margin=0)
+        def gap(c):
+            pts = [0] + sorted(list(c) + [m]) + [L]
+            return max(b - a for a, b in zip(pts, pts[1:]))
+        best = min(gap(c) for c in itertools.combinations(range(500, L, 500), n))
+        assert gap(got) <= best + 500             # grid step
+
+    def test_centres_stay_away_from_the_ends(self):
+        for c in _allocate_centres(20000, 4, [100]):
+            assert 700 <= c <= 19300
+
+    def test_zero_centres(self):
+        assert _allocate_centres(30000, 0, [10000]) == []
+
+
+def _ks_record(frag_len_pad=3000):
+    """BGC with two ketosynthase-like genes (G_A early, G_B late) and a regulator."""
+    ga = "ATG" + rnd(1200, 501, gc=True) + "TGA"
+    gb = "ATG" + rnd(1300, 502, gc=True) + "TGA"
+    reg = "ATG" + rnd(600, 503, gc=True) + "TGA"
+    seq = rnd(500, 504, gc=True) + ga + rnd(frag_len_pad, 505, gc=True) + gb + rnd(1500, 506, gc=True) \
+        + reg + rnd(2000, 507, gc=True)
+    a0 = 500
+    b0 = a0 + len(ga) + frag_len_pad
+    r0 = b0 + len(gb) + 1500
+    mk = lambda st, g, tag, prod, extra=None: SeqFeature(
+        FeatureLocation(st, st + len(g), strand=1), type="CDS",
+        qualifiers={"locus_tag": [tag], "product": [prod], **(extra or {})})
+    feats = [mk(a0, ga, "ctg_A", "ketoacyl-synt", {"gene": ["kasA"]}),
+             mk(b0, gb, "ctg_B", "ketoacyl-synt"),
+             mk(r0, reg, "ctg_R", "transcriptional regulator", {"protein_id": ["WP_REG.1"]})]
+    return SeqRecord(Seq(seq), id="bgc", features=feats), seq
+
+
+class TestExplicitMarkerGene:
+    def test_keyword_search_lists_the_other_candidates(self):
+        rec, frag = _ks_record()
+        m = find_marker_gene(rec, frag, ["ketoacyl-synt"])
+        assert m["n_matches"] == 2
+        assert {a["name"] for a in m["alternatives"]} == {"ctg_A", "ctg_B"} - {m["name"]}
+        assert all(a["end"] > a["start"] for a in m["alternatives"])
+
+    @pytest.mark.parametrize("tag,expected", [("ctg_A", "ctg_A"), ("CTG_b", "ctg_B"),
+                                              ("kasA", "ctg_A"), ("wp_reg.1", "ctg_R")])
+    def test_locus_tag_gene_and_protein_id_match_case_insensitively(self, tag, expected):
+        rec, frag = _ks_record()
+        m = find_marker_gene(rec, frag, ["ketoacyl-synt"], locus_tag=tag)
+        assert m["name"] == expected and m["keyword"] == "--marker-gene"
+
+    def test_explicit_tag_overrides_the_keyword_choice(self):
+        rec, frag = _ks_record()
+        by_kw = find_marker_gene(rec, frag, ["ketoacyl-synt"])["name"]
+        other = ({"ctg_A", "ctg_B"} - {by_kw}).pop()
+        assert find_marker_gene(rec, frag, ["ketoacyl-synt"], locus_tag=other)["name"] == other
+
+    def test_unknown_tag_raises_and_lists_available_loci(self):
+        rec, frag = _ks_record()
+        with pytest.raises(ValueError) as e:
+            find_marker_gene(rec, frag, [], locus_tag="nope_1")
+        assert "nope_1" in str(e.value) and "ctg_A" in str(e.value) and "ctg_B" in str(e.value)
+
+    def test_tag_in_annotation_but_not_in_fragment_raises(self):
+        rec, frag = _ks_record()
+        with pytest.raises(ValueError) as e:
+            find_marker_gene(rec, frag[:2500], [], locus_tag="ctg_B")      # gene B is cut off
+        assert "cannot be placed" in str(e.value)
+
+    def test_unannotated_bgc_raises(self):
+        with pytest.raises(ValueError):
+            find_marker_gene(SeqRecord(Seq("ACGT" * 100)), "ACGT" * 100, [], locus_tag="x")
+        with pytest.raises(ValueError):
+            find_marker_gene(None, "ACGT" * 100, [], locus_tag="x")
+
+    def test_design_uses_the_pinned_gene_and_reports_alternatives(self):
+        rec, frag = _ks_record()
+        v5, v3 = rnd(3000, 511), rnd(2500, 512)
+        auto = design_screening(v5 + frag + v3, len(v5), len(frag), fragment_seq=frag, bgc_record=rec,
+                                config=PipelineConfig(screening_marker_keywords=["ketoacyl-synt"]))
+        picked = auto.marker["name"]
+        other = ({"ctg_A", "ctg_B"} - {picked}).pop()
+        assert any(other in n and "--marker-gene" in n for n in auto.notes)
+        pinned = design_screening(v5 + frag + v3, len(v5), len(frag), fragment_seq=frag, bgc_record=rec,
+                                  config=PipelineConfig(screening_marker_gene=other))
+        assert pinned.marker["name"] == other
+        mk = [a for a in pinned.amplicons if a.role == "marker-gene"][0]
+        assert "selected with --marker-gene" in mk.target and other in mk.target
+        # the primers really sit inside the pinned gene
+        start = len(v5) + pinned.marker["start"]
+        assert start - 1 <= mk.forward.start and mk.reverse.end <= len(v5) + pinned.marker["end"] + 61
+
+    def test_design_raises_for_an_unknown_pinned_gene(self):
+        rec, frag = _ks_record()
+        v5, v3 = rnd(3000, 511), rnd(2500, 512)
+        with pytest.raises(ValueError):
+            design_screening(v5 + frag + v3, len(v5), len(frag), fragment_seq=frag, bgc_record=rec,
+                             config=PipelineConfig(screening_marker_gene="missing"))
+
+
+class TestCoverage:
+    def test_coverage_is_recorded_and_gaps_tile_the_fragment(self):
+        v5, v3, frag = rnd(3000, 601), rnd(2500, 602), rnd(37800, 603, gc=True)
+        d = design_screening(v5 + frag + v3, len(v5), len(frag), fragment_seq=frag,
+                             config=PipelineConfig())
+        gaps = d.coverage_gaps
+        assert gaps[0][0] == 0 and gaps[-1][1] == len(frag)
+        assert all(a[1] == b[0] for a, b in zip(gaps, gaps[1:]))
+        assert d.max_gap_bp == max(b - a for a, b in gaps)
+
+    def test_long_uncovered_stretch_is_noted(self):
+        v5, v3, frag = rnd(3000, 611), rnd(2500, 612), rnd(37800, 613, gc=True)
+        d = design_screening(v5 + frag + v3, len(v5), len(frag), fragment_seq=frag,
+                             config=PipelineConfig(screening_n_spaced=0))
+        assert d.max_gap_bp > 12000 and any("longest" in n or "largest stretch" in n for n in d.notes)
+
+    def test_denser_panel_has_a_shorter_longest_gap(self):
+        v5, v3, frag = rnd(3000, 621), rnd(2500, 622), rnd(37800, 623, gc=True)
+        gap = lambda n: design_screening(v5 + frag + v3, len(v5), len(frag), fragment_seq=frag,
+                                         config=PipelineConfig(screening_n_spaced=n)).max_gap_bp
+        assert gap(4) < gap(2) < gap(1)
+
+    def test_real_geometry_beats_the_previous_placement(self):
+        # marker gene at ~27 kb of a 37.8 kb fragment, as in the colinomicina BGC
+        L = 37800
+        ks = "ATG" + rnd(1300, 631, gc=True) + "TGA"
+        frag = rnd(26800, 632, gc=True) + ks + rnd(L - 26800 - len(ks), 633, gc=True)
+        rec = SeqRecord(Seq(frag), id="b", features=[SeqFeature(
+            FeatureLocation(26800, 26800 + len(ks), strand=1), type="CDS",
+            qualifiers={"locus_tag": ["ctg2_59"], "product": ["ketoacyl-synt"]})])
+        v5, v3 = rnd(3000, 634), rnd(2500, 635)
+        d = design_screening(v5 + frag + v3, len(v5), len(frag), fragment_seq=frag, bgc_record=rec,
+                             config=PipelineConfig(screening_marker_keywords=["ketoacyl-synt"]))
+        assert d.marker["name"] == "ctg2_59"
+        assert d.max_gap_bp < 12600          # the previous placement left 12.6 kb here
+        assert d.max_gap_bp <= 11000
+
+
+# ------------------------------------------------------------ CLI: --marker-gene
+class TestCliMarkerGene:
+    def _files(self, tmp_path):
+        r = random.Random(7)
+        g = lambda n: "".join(r.choices("ACGT", weights=[14, 36, 36, 14], k=n))
+        left, right = g(1000), g(1000)
+        genes = [("G0", g(1500)), ("G1", "ATG" + g(1200) + "TGA"), ("G2", g(1800)),
+                 ("G3", "ATG" + g(1300) + "TGA")]
+        body, feats, pos = "", [], 1000
+        for tag, ge in genes:
+            feats.append(SeqFeature(FeatureLocation(pos + len(body), pos + len(body) + len(ge), strand=1),
+                                    type="CDS", qualifiers={"locus_tag": [tag], "product": [
+                                        "ketosynthase" if tag in ("G1", "G3") else "hypothetical protein"]}))
+            body += ge + g(300)
+        bgc = left + body + right
+        feats.append(SeqFeature(FeatureLocation(1000, 1000 + len(body)), type="cluster",
+                                qualifiers={"product": ["T2PKS"]}))
+        rec = SeqRecord(Seq(bgc), id="BGC", name="BGC", description="syn",
+                        annotations={"molecule_type": "DNA"},
+                        features=[SeqFeature(FeatureLocation(0, len(bgc)), type="source")] + feats)
+        from Bio import SeqIO
+        gb = tmp_path / "bgc.gbk"
+        SeqIO.write(rec, str(gb), "genbank")
+        genome = tmp_path / "genome.fa"
+        genome.write_text(">chr1\n" + g(6000) + bgc + g(6000) + "\n")
+        return gb, genome
+
+    def _run(self, tmp_path, *extra):
+        import subprocess
+        import sys
+        from pathlib import Path
+        gb, genome = self._files(tmp_path)
+        td = Path(__file__).resolve().parent.parent / "test_data"
+        out = tmp_path / "out"
+        proc = subprocess.run(
+            [sys.executable, "-m", "tar_crispr.cli", "run", "--bgc", str(gb), "--genbank", str(gb),
+             "--vector", str(td / "synthetic_vector.fasta"), "--genome", str(genome),
+             "--output", str(out), "--no-blast", *extra], capture_output=True, text=True)
+        return proc, out
+
+    def test_marker_gene_is_used_and_reported(self, tmp_path):
+        proc, out = self._run(tmp_path, "--marker-gene", "G3", "--marker-keyword", "ketosynthase")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        rep = (out / "report.md").read_text()
+        mk = [ln for ln in rep.splitlines() if ln.startswith("- **MK**")][0]
+        assert "G3" in mk and "selected with --marker-gene" in mk
+        assert "Interior coverage" in rep
+
+    def test_unknown_marker_gene_fails_with_a_clear_message(self, tmp_path):
+        proc, out = self._run(tmp_path, "--marker-gene", "NOPE")
+        assert proc.returncode != 0
+        assert "NOPE" in (proc.stdout + proc.stderr) and "not found" in (proc.stdout + proc.stderr)
+        assert not (out / "report.md").exists()

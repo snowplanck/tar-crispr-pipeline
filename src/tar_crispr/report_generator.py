@@ -689,6 +689,11 @@ def generate_report(sgRNAs: dict,
             for a in screening.amplicons:
                 md.append(f"- **{a.name}** ({a.role}): {a.target}")
             md.append("")
+            if screening.max_gap_bp:
+                a0, b0 = screening.max_gap_span
+                md.append(f"**Interior coverage:** the longest stretch of the BGC without an interior "
+                          f"amplicon is {screening.max_gap_bp / 1000:.1f} kb ({a0 / 1000:.1f}-"
+                          f"{b0 / 1000:.1f} kb from the left end). Products differ by at least 150 bp.\n")
             md.append("**Expected result:** correct clone = all bands above; empty vector = "
                       "no band in any lane except vector-only controls; partial insert = junction "
                       "bands present but one or more interior bands missing. Confirm positive "

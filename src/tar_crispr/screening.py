@@ -10,10 +10,12 @@ is sequenced. This module designs that panel on the *final construct*:
 * **marker-gene** - an amplicon inside a core biosynthetic gene (type II PKS
   KS/CLF by default), found in the GenBank annotation of the BGC.
 * **integrity** - amplicons spread along the BGC, to catch deletions and
-  partial captures that still have both junctions.
+  partial captures that still have both junctions. They are placed so that the
+  largest stretch of BGC without an interior amplicon is as short as possible,
+  taking the marker gene into account.
 
-Every amplicon gets a different product size so the panel can be run as one
-multiplex or read from a single gel. Candidate pairs come from primer3; each is
+Product sizes differ by at least 150 bp between any two amplicons, so the panel
+can be read from a single gel or run as one multiplex. Candidate pairs come from primer3; each is
 then checked by an in-silico PCR on the construct (the intended product must be
 the only one for that pair), against an optional host genome (yeast), and for
 cross-dimers with the primers already chosen.
@@ -36,9 +38,21 @@ from tar_crispr.config import (
 
 _COMP = str.maketrans("ACGTN", "TGCAN")
 
-# Product-size ladder: ranges are >= 150 bp apart so bands resolve on a gel.
-SIZE_LADDER = [(300, 450), (500, 650), (700, 850), (900, 1050),
-               (1100, 1250), (1300, 1450), (1500, 1650), (1700, 1850)]
+# Product-size slots. Each slot is 100 bp wide and consecutive slots are 150 bp apart
+# (top of one slot to the bottom of the next), so any two products of one panel differ by
+# at least MIN_PRODUCT_SEPARATION bp and resolve as separate bands on a gel. (Slots 50 bp
+# apart, as an earlier version had, let two products land 92 bp apart.)
+MIN_PRODUCT_SEPARATION = 150
+SLOT_WIDTH = 100
+
+
+def size_slot(i: int) -> tuple:
+    """The i-th product-size slot: (300, 400), (550, 650), (800, 900), ..."""
+    lo = 300 + (SLOT_WIDTH + MIN_PRODUCT_SEPARATION) * i
+    return (lo, lo + SLOT_WIDTH)
+
+
+SIZE_LADDER = [size_slot(i) for i in range(8)]
 
 CROSS_DIMER_WARN_DG = -9000.0     # cal/mol (primer3 heterodimer dG at 37 C)
 MAX_MISMATCH_SITE = 3             # a site with <= this many mismatches can prime
@@ -206,16 +220,74 @@ def _kw_regex(keyword: str):
     return re.compile(r"[\s_\-]+".join(re.escape(t) for t in tokens), re.IGNORECASE)
 
 
-def find_marker_gene(bgc_record, fragment_seq: str, keywords: list) -> Optional[dict]:
-    """Locate a core biosynthetic gene of the BGC annotation inside the fragment.
+def _cds_name(feature) -> str:
+    q = feature.qualifiers
+    return str((q.get("locus_tag") or q.get("gene") or q.get("protein_id") or ["CDS"])[0])
 
-    Keywords are tried in priority order against each CDS's product/gene/
-    gene_functions/sec_met_domain/note text. The gene is located by searching its
-    nucleotide sequence in the fragment (either strand), so no coordinate
-    translation between the annotation record, the genome and the fragment is
-    needed. Among CDSs matching the first productive keyword, the one nearest
-    the fragment centre is used. Returns ``None`` if nothing matches.
+
+def _locate_cds(feature, bgc_record, fragment: str):
+    """Place a CDS in the fragment by its nucleotide sequence (either strand).
+
+    Returns ``((start, length, strand), None)`` or ``(None, reason)``. Searching by
+    sequence needs no coordinate translation between the annotation record, the
+    genome and the fragment.
     """
+    try:
+        gene = _clean(str(feature.extract(bgc_record.seq)))
+    except Exception:
+        return None, "its sequence could not be extracted from the annotation"
+    if len(gene) < 90:
+        return None, "it is shorter than 90 bp"
+    for strand, query in (("+", gene), ("-", _rc(gene))):
+        n = fragment.count(query)
+        if n == 1:
+            return (fragment.find(query), len(gene), strand), None
+        if n > 1:
+            return None, "its sequence occurs more than once in the fragment"
+    return None, "its sequence is not in the fragment (annotation and fragment differ?)"
+
+
+def _marker_by_tag(bgc_record, fragment: str, tag: str) -> dict:
+    """The CDS named *tag* (locus_tag, gene or protein_id; case-insensitive)."""
+    wanted = tag.strip().lower()
+    cds = [f for f in bgc_record.features if f.type == "CDS"]
+    matches = [f for f in cds
+               if any(str(v).strip().lower() == wanted
+                      for k in ("locus_tag", "gene", "protein_id") for v in f.qualifiers.get(k, []))]
+    if not matches:
+        names = [_cds_name(f) for f in sorted(cds, key=lambda f: int(f.location.start))]
+        shown = ", ".join(names[:20]) + (" ..." if len(names) > 20 else "")
+        raise ValueError(f"marker gene {tag!r} not found: no CDS has it as locus_tag, gene or "
+                         f"protein_id. CDSs in the annotation: {shown or 'none'}")
+    if len(matches) > 1:
+        raise ValueError(f"marker gene {tag!r} is ambiguous ({len(matches)} CDSs); use the locus_tag")
+    f = matches[0]
+    loc, reason = _locate_cds(f, bgc_record, fragment)
+    if loc is None:
+        raise ValueError(f"marker gene {tag!r} is in the annotation but cannot be placed in the "
+                         f"fragment: {reason}")
+    pos, length, strand = loc
+    return {"name": _cds_name(f), "product": str((f.qualifiers.get("product") or [""])[0]),
+            "keyword": "--marker-gene", "evidence": f"selected by name ({tag})",
+            "start": pos, "end": pos + length, "strand": strand, "n_matches": 1,
+            "alternatives": []}
+
+
+def find_marker_gene(bgc_record, fragment_seq: str, keywords: list,
+                     locus_tag: Optional[str] = None) -> Optional[dict]:
+    """Locate the marker gene of the BGC annotation inside the fragment.
+
+    With ``locus_tag`` the named CDS is used (a ``ValueError`` explains why if it is not
+    in the annotation or cannot be placed in the fragment). Otherwise keywords are tried
+    in priority order against each CDS's product/gene/gene_functions/sec_met_domain/note
+    text, ignoring case and treating ``-``, ``_`` and spaces alike; among CDSs matching
+    the first productive keyword, the one nearest the fragment centre is used and the
+    others are returned under ``alternatives``. Returns ``None`` if nothing matches.
+    """
+    if locus_tag:
+        if bgc_record is None or not getattr(bgc_record, "features", None):
+            raise ValueError("--marker-gene needs an annotated BGC (give --genbank)")
+        return _marker_by_tag(bgc_record, _clean(fragment_seq), locus_tag)
     if bgc_record is None or not getattr(bgc_record, "features", None):
         return None
     fragment = _clean(fragment_seq)
@@ -230,30 +302,21 @@ def find_marker_gene(bgc_record, fragment_seq: str, keywords: list) -> Optional[
             m_kw = rx.search(text) if rx else None
             if m_kw is None:
                 continue
+            loc, _ = _locate_cds(f, bgc_record, fragment)
+            if loc is None:
+                continue
+            pos, length, strand = loc
             at, kw_len = m_kw.start(), m_kw.end() - m_kw.start()
-            try:
-                gene = _clean(str(f.extract(bgc_record.seq)))
-            except Exception:
-                continue
-            if len(gene) < 90:
-                continue
-            pos = fragment.find(gene)
-            strand = "+"
-            if pos < 0:
-                pos = fragment.find(_rc(gene))
-                strand = "-"
-            if pos < 0 or fragment.count(gene if strand == "+" else _rc(gene)) != 1:
-                continue
-            name = (f.qualifiers.get("locus_tag") or f.qualifiers.get("gene")
-                    or f.qualifiers.get("protein_id") or ["CDS"])[0]
-            product = (f.qualifiers.get("product") or [""])[0]
-            evidence = text[max(0, at - 30): at + kw_len + 50].strip()
-            hits.append({"name": str(name), "product": str(product), "keyword": kw,
-                         "evidence": evidence,
-                         "start": pos, "end": pos + len(gene), "strand": strand})
+            hits.append({"name": _cds_name(f),
+                         "product": str((f.qualifiers.get("product") or [""])[0]),
+                         "keyword": kw, "evidence": text[max(0, at - 30): at + kw_len + 50].strip(),
+                         "start": pos, "end": pos + length, "strand": strand})
         if hits:
-            best = min(hits, key=lambda h: abs((h["start"] + h["end"]) / 2 - centre))
+            hits.sort(key=lambda h: abs((h["start"] + h["end"]) / 2 - centre))
+            best = hits[0]
             best["n_matches"] = len(hits)
+            best["alternatives"] = [{k: h[k] for k in ("name", "product", "start", "end")}
+                                    for h in hits[1:]]
             return best
     return None
 
@@ -411,15 +474,38 @@ def _design_one(name: str, role: str, target: str, construct: str, cons: Backgro
 # --------------------------------------------------------------------------
 # Public entry point
 # --------------------------------------------------------------------------
-def _spaced_centres(frag_len: int, n: int, avoid: Optional[tuple]) -> list:
+def _allocate_centres(frag_len: int, n: int, fixed: Optional[list] = None,
+                      margin: int = 700) -> list:
+    """Centres for *n* integrity amplicons that minimise the longest uncovered stretch.
+
+    ``fixed`` are positions already covered (the marker gene). The fragment is split by
+    them into gaps, and each new amplicon goes into whichever gap currently has the
+    largest sub-gap (gap / (points already in it + 1)), which minimises the maximum
+    sub-gap; within a gap the points are evenly spaced. Without ``fixed`` this is plain
+    even spacing (L/4, L/2, 3L/4 for n = 3).
+    """
+    pts = sorted({0, frag_len, *[int(x) for x in (fixed or []) if 0 < x < frag_len]})
+    gaps = list(zip(pts, pts[1:]))
+    k = [0] * len(gaps)
+    for _ in range(n):
+        i = max(range(len(gaps)), key=lambda j: ((gaps[j][1] - gaps[j][0]) / (k[j] + 1), -j))
+        k[i] += 1
     centres = []
-    for i in range(1, n + 1):
-        c = int(frag_len * i / (n + 1))
-        if avoid and abs(c - (avoid[0] + avoid[1]) / 2) < 1500:
-            shift = 1500 if c >= (avoid[0] + avoid[1]) / 2 else -1500
-            c = min(max(c + shift, 700), frag_len - 700)
-        centres.append(c)
-    return centres
+    for (a, b), kk in zip(gaps, k):
+        for j in range(1, kk + 1):
+            c = a + (b - a) * j / (kk + 1)
+            centres.append(int(min(max(c, margin), frag_len - margin)))
+    return sorted(centres)
+
+
+def _coverage(design: ScreeningDesign, JL: int, frag_len: int) -> None:
+    """Record the stretches of the BGC between neighbouring interior amplicons."""
+    mids = sorted(int((a.start + a.end) / 2) - JL for a in design.amplicons
+                  if a.role in ("marker-gene", "integrity"))
+    pts = [0] + [m for m in mids if 0 < m < frag_len] + [frag_len]
+    design.coverage_gaps = list(zip(pts, pts[1:]))
+    design.max_gap_span = max(design.coverage_gaps, key=lambda g: g[1] - g[0])
+    design.max_gap_bp = design.max_gap_span[1] - design.max_gap_span[0]
 
 
 def design_screening(construct: str, left_junction: int, fragment_len: int,
@@ -453,7 +539,7 @@ def design_screening(construct: str, left_junction: int, fragment_len: int,
     counter = {"i": 0}
 
     def next_range() -> tuple:
-        return SIZE_LADDER[min(counter["i"], len(SIZE_LADDER) - 1)]
+        return size_slot(counter["i"])
 
     def run(name, role, target, win, lreg, rreg):
         size_range = next_range()
@@ -477,45 +563,85 @@ def design_screening(construct: str, left_junction: int, fragment_len: int,
 
     # --- marker gene -----------------------------------------------------------
     has_features = bool(bgc_record is not None and getattr(bgc_record, "features", None))
-    marker = (find_marker_gene(bgc_record, fragment_seq, config.screening_marker_keywords)
-              if fragment_seq and has_features else None)
+    if config.screening_marker_gene:
+        if not fragment_seq:
+            raise ValueError("--marker-gene needs the fragment sequence")
+        marker = find_marker_gene(bgc_record, fragment_seq, [], locus_tag=config.screening_marker_gene)
+    else:
+        marker = (find_marker_gene(bgc_record, fragment_seq, config.screening_marker_keywords)
+                  if fragment_seq and has_features else None)
     n_spaced = max(0, config.screening_n_spaced)
-    marker_ok = False
+    marker_ok, marker_mid = False, None
     if marker:
         design.marker = marker
         gs, ge = JL + marker["start"], JL + marker["end"]
         if marker.get("n_matches", 1) > 1:
+            alts = ", ".join(
+                f"{a['name']} ({a['start'] / 1000:.1f}-{a['end'] / 1000:.1f} kb"
+                + (f", {a['product']}" if a["product"] else "") + ")"
+                for a in marker.get("alternatives", [])[:5])
             design.notes.append(
                 f"keyword '{marker['keyword']}' matched {marker['n_matches']} CDS; "
-                f"{marker['name']} (nearest the BGC centre) was used. Check it is the gene you "
-                "want, or narrow it with --marker-keyword")
+                f"{marker['name']} (nearest the BGC centre) was used. Other candidates: {alts}. "
+                "Pick one explicitly with --marker-gene LOCUS_TAG")
+        how = ("selected with --marker-gene" if marker["keyword"] == "--marker-gene"
+               else f"matched '{marker['keyword']}' in: \"{marker.get('evidence', '')}\"")
         amp = run("MK", "marker-gene",
                   f"{marker['name']} ({marker['product'] or marker['keyword']}) at construct "
-                  f"{gs + 1}-{ge}; matched '{marker['keyword']}' in: \"{marker.get('evidence', '')}\"",
+                  f"{gs + 1}-{ge}; {how}",
                   (gs - 150, ge + 150), (gs, ge - 60), (gs + 60, ge + 60))
         marker_ok = amp is not None
-        if not marker_ok:
+        if marker_ok:
+            marker_mid = int((amp.start + amp.end) / 2) - JL
+        else:
             design.notes.append(f"marker gene {marker['name']} is too short or has no suitable primers "
                                 "for a marker amplicon; a spaced amplicon was added instead")
     elif has_features:
         design.notes.append("no CDS matched the marker keywords "
                             f"{config.screening_marker_keywords}; spaced amplicons used instead "
-                            "(use --marker-keyword to choose a gene)")
+                            "(use --marker-keyword or --marker-gene to choose a gene)")
     else:
         design.notes.append("BGC has no annotation (FASTA input): no marker gene; spaced integrity "
                             "amplicons used instead (give --genbank to target a core gene)")
     if not marker_ok:
         n_spaced += 1                      # keep the panel size when there is no marker
 
-    # --- integrity amplicons spread over the fragment --------------------------
-    avoid = (marker["start"], marker["end"]) if marker else None
-    for i, c in enumerate(_spaced_centres(fragment_len, n_spaced, avoid), 1):
+    # --- integrity amplicons: minimise the longest stretch without an amplicon --
+    centres = _allocate_centres(fragment_len, n_spaced, [marker_mid] if marker_ok else [])
+    for i, c in enumerate(centres, 1):
         size_range = next_range()
-        centre = JL + c
+        counter["i"] += 1
         half = size_range[1] // 2 + 150
-        run(f"IN{i}", "integrity",
-            f"BGC interior, ~{c / 1000:.1f} kb from the left end (construct ~{centre + 1})",
-            (centre - half, centre + half), (centre - half, centre), (centre, centre + half))
+        amp, used = None, c
+        for off in (0, 800, -800, 1600, -1600):          # nudge along the BGC if the spot has no primers
+            used = min(max(c + off, 700), fragment_len - 700)
+            centre = JL + used
+            amp = _design_one(f"IN{i}", "integrity",
+                              f"BGC interior, ~{used / 1000:.1f} kb from the left end "
+                              f"(construct ~{centre + 1})", construct, cons,
+                              (centre - half, centre + half), (centre - half, centre),
+                              (centre, centre + half), size_range, config, chosen, host)
+            if amp is not None:
+                break
+        if amp is None:
+            design.failed.append(f"IN{i} (BGC interior, ~{c / 1000:.1f} kb): no primer pair "
+                                 "satisfied the constraints")
+        else:
+            if used != c:
+                design.notes.append(f"IN{i} was moved {abs(used - c)} bp along the BGC "
+                                    "because no primer pair fit at the planned position")
+            design.amplicons.append(amp)
+            chosen.append(amp)
+
+    # --- coverage of the BGC by interior amplicons -----------------------------
+    if design.amplicons:
+        _coverage(design, JL, fragment_len)
+        if design.max_gap_bp > config.screening_max_gap_bp:
+            a0, b0 = design.max_gap_span
+            design.notes.append(
+                f"largest stretch of the BGC without an interior amplicon: "
+                f"{design.max_gap_bp / 1000:.1f} kb ({a0 / 1000:.1f}-{b0 / 1000:.1f} kb from the "
+                "left end); raise --screening-spaced for denser coverage")
 
     # --- panel-level checks: multiplex cross products ---------------------------
     if len(design.amplicons) > 1:
@@ -571,6 +697,6 @@ def export_screening(design: ScreeningDesign, path: str) -> str:
 
 
 __all__ = [
-    "SIZE_LADDER", "find_primer_sites", "predict_amplicons", "find_marker_gene",
+    "SIZE_LADDER", "MIN_PRODUCT_SEPARATION", "size_slot", "find_primer_sites", "predict_amplicons", "find_marker_gene",
     "design_screening", "screening_rows", "export_screening",
 ]
