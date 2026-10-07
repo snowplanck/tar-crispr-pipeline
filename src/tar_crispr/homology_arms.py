@@ -55,22 +55,43 @@ def extract_homology_arm(fragment_seq: str,
         raise ValueError(f"end must be 'left' or 'right', got '{end}'")
 
 
-def validate_gc(arm: str, config: PipelineConfig) -> tuple[bool, list[str]]:
+def gc_limits(config: PipelineConfig,
+              reference_gc: Optional[float] = None) -> tuple[float, float]:
+    """Return ``(ideal_max, warning_max)`` GC% limits for an arm.
+
+    The configured absolute limits are the floor. When ``reference_gc`` (the GC%
+    of the fragment the arm comes from) is given and ``config.relative_arm_gc``
+    is on, the limits rise with it, so that a ~72% GC *Streptomyces* fragment is
+    not penalised for having ~72% GC arms. The ideal limit never exceeds the
+    warning limit.
+    """
+    ideal = config.max_gc * 100
+    warn = config.max_gc_warning * 100
+    if reference_gc is not None and config.relative_arm_gc:
+        warn = max(warn, reference_gc + config.arm_gc_hard_margin)
+        ideal = min(warn, max(ideal, reference_gc + config.arm_gc_soft_margin))
+    return ideal, warn
+
+
+def validate_gc(arm: str, config: PipelineConfig,
+                reference_gc: Optional[float] = None) -> tuple[bool, list[str]]:
     """Check GC content of the arm against configured thresholds.
 
-    Returns (passed, issues).
+    ``reference_gc`` (GC% of the source fragment) makes the upper limits
+    relative, see :func:`gc_limits`. Returns (passed, issues).
     """
     issues = []
     if len(arm) == 0:
         return False, ["Arm is empty"]
     gc = gc_fraction(arm) * 100
+    ideal, warn = gc_limits(config, reference_gc)
     if gc < config.min_gc * 100:
         issues.append(f"GC% {gc:.1f} below minimum {config.min_gc * 100:.0f}%")
-    if gc > config.max_gc * 100:
-        if gc > config.max_gc_warning * 100:
-            issues.append(f"GC% {gc:.1f} exceeds warning threshold {config.max_gc_warning * 100:.0f}%")
+    if gc > ideal:
+        if gc > warn:
+            issues.append(f"GC% {gc:.1f} exceeds warning threshold {warn:.0f}%")
         else:
-            issues.append(f"GC% {gc:.1f} above ideal range {config.max_gc * 100:.0f}%")
+            issues.append(f"GC% {gc:.1f} above ideal range {ideal:.0f}%")
     return len(issues) == 0, issues
 
 
@@ -205,14 +226,15 @@ def check_restriction_sites(arm: str, enzymes: list[str]) -> tuple[bool, list[st
 
 
 def validate_arm(arm: str, genome_seq: str, vector_seq: str,
-                 config: PipelineConfig) -> tuple[bool, list[str]]:
+                 config: PipelineConfig,
+                 reference_gc: Optional[float] = None) -> tuple[bool, list[str]]:
     """Run all validation checks on a homology arm.
 
     Returns (passed, issues_list).
     """
     all_issues = []
 
-    _, gc_issues = validate_gc(arm, config)
+    _, gc_issues = validate_gc(arm, config, reference_gc)
     all_issues.extend(gc_issues)
 
     _, uniq_issues = check_uniqueness(arm, genome_seq, vector_seq, config)
@@ -231,7 +253,8 @@ def find_valid_arm(fragment_seq: str, end: str,
                    config: PipelineConfig,
                    genome_seq: str,
                    vector_seq: str,
-                   max_attempts: Optional[int] = None) -> HomologyArm:
+                   max_attempts: Optional[int] = None,
+                   reference_gc: Optional[float] = None) -> HomologyArm:
     """Find a valid homology arm by extracting and optionally shifting.
 
     Tries the default arm length first. If validation fails, shifts the window
@@ -280,7 +303,7 @@ def find_valid_arm(fragment_seq: str, end: str,
                 break
             arm = fragment_seq[start:stop]
 
-        passed, issues = validate_arm(arm, genome_seq, vector_seq, config)
+        passed, issues = validate_arm(arm, genome_seq, vector_seq, config, reference_gc)
         arm_obj = HomologyArm(
             sequence=arm,
             end=end,
@@ -326,13 +349,19 @@ def design_homology_arms(fragment_seq: str,
     dict
         ``{"left": HomologyArm, "right": HomologyArm}``
     """
-    left_arm = find_valid_arm(fragment_seq, "left", config, genome_seq, vector_seq)
-    right_arm = find_valid_arm(fragment_seq, "right", config, genome_seq, vector_seq)
+    # GC limits are relative to the fragment the arms are cut from.
+    reference_gc = (gc_fraction(fragment_seq) * 100
+                    if config.relative_arm_gc and fragment_seq else None)
+    left_arm = find_valid_arm(fragment_seq, "left", config, genome_seq, vector_seq,
+                              reference_gc=reference_gc)
+    right_arm = find_valid_arm(fragment_seq, "right", config, genome_seq, vector_seq,
+                               reference_gc=reference_gc)
 
     return {"left": left_arm, "right": right_arm}
 
 
 __all__ = [
+    "gc_limits",
     "extract_homology_arm",
     "validate_gc",
     "check_uniqueness",

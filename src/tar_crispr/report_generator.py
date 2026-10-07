@@ -15,8 +15,8 @@ from tar_crispr.config import (
 def _format_sgRNA_table(sgRNAs: dict) -> str:
     """Format sgRNA candidates into a Markdown table."""
     lines = [
-        "| End | Strand | Position | Protospacer (20nt) | PAM | Cut Pos | GC% | Poly-T |",
-        "|------|--------|----------|-------------------|-----|---------|-----|--------|",
+        "| End | Strand | Position | Protospacer (20nt) | PAM | Cut Pos | GC% | Poly-T | Specificity |",
+        "|------|--------|----------|-------------------|-----|---------|-----|--------|-------------|",
     ]
     for end_label, candidates in sgRNAs.items():
         end_name = {"left": "Upstream", "right": "Downstream"}.get(end_label, end_label)
@@ -24,8 +24,33 @@ def _format_sgRNA_table(sgRNAs: dict) -> str:
             lines.append(
                 f"| {end_name} | {sg.strand} | {sg.position} | "
                 f"`{sg.protospacer}` | {sg.pam} | {sg.cut_position} | "
-                f"{sg.gc_percent} | {'Yes' if sg.polyt_flag else 'No'} |"
+                f"{sg.gc_percent} | {'Yes' if sg.polyt_flag else 'No'} | "
+                f"{sg.specificity_score if sg.specificity_score is not None else '—'} |"
             )
+    return "\n".join(lines)
+
+
+_COMPONENT_LABELS = {
+    "specificity": "weakest-guide specificity", "guide_quality": "guide quality",
+    "flank": "extra flank", "cut_warnings": "cut-site warnings", "arms": "homology arms",
+}
+
+
+def _format_pair_table(pairs: list, limit: int = 10) -> str:
+    """Markdown table of the best-ranked guide pairs."""
+    lines = [
+        "| # | Left guide | Right guide | Fragment (bp) | Min spec. | Score | Status |",
+        "|---|------------|-------------|---------------|-----------|-------|--------|",
+    ]
+    for p in pairs[:limit]:
+        status = ("excluded (cut site)" if p.excluded
+                  else "arms evaluated" if p.arms_evaluated else "arms not evaluated")
+        spec = f"{p.specificity:.1f}" if p.specificity is not None else "—"
+        lines.append(
+            f"| {p.rank} | `{p.left.protospacer}` | `{p.right.protospacer}` | "
+            f"{p.fragment_length} | {spec} | {p.score:.1f} | {status} |")
+    if len(pairs) > limit:
+        lines.append(f"| … | {len(pairs) - limit} more pair(s) not shown | | | | | |")
     return "\n".join(lines)
 
 
@@ -446,7 +471,10 @@ def generate_report(sgRNAs: dict,
                     config: PipelineConfig,
                     genome_stats: dict,
                     output_dir: str,
-                    selected_sgRNAs: Optional[dict] = None) -> str:
+                    selected_sgRNAs: Optional[dict] = None,
+                    cut_safety=None,
+                    pair_ranking: Optional[list] = None,
+                    screening=None) -> str:
     """Generate the final report in Markdown format with embedded SVG.
 
     Parameters
@@ -471,6 +499,15 @@ def generate_report(sgRNAs: dict,
         Directory to write report files.
     selected_sgRNAs : dict, optional
         User-selected sgRNAs (overrides auto-selection).
+    cut_safety : PairReport, optional
+        Result of the Cas9 cut-site safety checks for the selected pair
+        (from ``cut_specificity``); adds a section to the report.
+    pair_ranking : list, optional
+        Ranked ``PairCandidate`` objects (from ``pair_ranking.rank_pairs``);
+        adds the pair-ranking table and the score breakdown of the pair in use.
+    screening : ScreeningDesign, optional
+        Colony-PCR screening panel (from ``screening.design_screening``); adds
+        section 7 and writes ``screening_primers.csv``.
 
     Returns
     -------
@@ -539,6 +576,50 @@ def generate_report(sgRNAs: dict,
     md.append(_format_sgRNA_table(sgRNAs))
     md.append("")
 
+    # Pair ranking
+    if pair_ranking:
+        md.append("### Guide pair ranking\n")
+        md.append("Pairs are scored on a 0–100 scale: the weakest guide's genome-wide "
+                  "specificity, minus penalties for guide quality, extra flanking DNA, "
+                  "cut-site warnings and (for the best pairs) homology-arm problems. "
+                  "Weights are heuristic constants, not a fitted model.\n")
+        md.append(_format_pair_table(pair_ranking))
+        md.append("")
+        used = next((p for p in pair_ranking
+                     if p.left.cut_position == left_sg.cut_position
+                     and p.right.cut_position == right_sg.cut_position), None)
+        if used is not None:
+            md.append(f"**Selected pair (#{used.rank}) score breakdown:**\n")
+            for key, val in used.components.items():
+                md.append(f"- {_COMPONENT_LABELS.get(key, key)}: {val + 0.0:+.1f}" if key != "specificity"
+                          else f"- {_COMPONENT_LABELS[key]}: {val:.1f}")
+            md.append(f"- **total: {used.score:.1f}**")
+            md.append("")
+            if used.notes:
+                md.append("**Notes:**\n")
+                md.extend(f"- {n}" for n in used.notes)
+                md.append("")
+
+    # Cas9 cut-site safety (mode-dependent)
+    md.append(f"### Cas9 cut-site safety (mode: `{config.mode}`)\n")
+    if cut_safety is None:
+        md.append("_Cut-site safety checks were not run._\n")
+    else:
+        md.append("**Result:** " + ("PASS — no unwanted high-confidence cut sites"
+                                    if cut_safety.ok else "FAIL — see issues below") + "\n")
+        for label, items in (("Issues", cut_safety.hard_issues),
+                             ("Warnings", cut_safety.warnings),
+                             ("Notes", cut_safety.notes)):
+            if items:
+                md.append(f"**{label}:**\n")
+                md.extend(f"- {i}" for i in items)
+                md.append("")
+    for name, g in (("Left", left_sg), ("Right", right_sg)):
+        if getattr(g, "warnings", None):
+            md.append(f"**{name} sgRNA notes:**\n")
+            md.extend(f"- {w}" for w in g.warnings)
+            md.append("")
+
     # Section 3: Fragment Definition
     md.append("## 3. Excised Fragment\n")
     md.append(f"| Property | Value |")
@@ -582,6 +663,53 @@ def generate_report(sgRNAs: dict,
     else:
         md.append(f"\nNo issues detected. Assembly verified.")
     md.append("")
+
+    # Section 6.1: Colony-PCR screening panel (designed on the assembled construct)
+    if screening is not None and (screening.amplicons or screening.failed or screening.notes):
+        from tar_crispr.screening import export_screening
+        md.append("### 6.1 Colony-PCR Screening Panel\n")
+        md.append("Primers placed on the assembled construct to screen yeast (or E. coli) "
+                  "colonies. Junction amplicons only appear when the vector is joined to the "
+                  "BGC end; the empty re-circularised vector gives no junction band. Each "
+                  "amplicon has a distinct size so the panel can be read from one gel. "
+                  f"Construct: {screening.construct_length} bp; left junction at position "
+                  f"{screening.left_junction + 1}, right junction at {screening.right_junction + 1}. "
+                  "Tm: primer3 nearest-neighbour, 50 mM Na+, 1.5 mM Mg2+, 0.6 mM dNTP, 50 nM primer.\n")
+        if screening.amplicons:
+            md.append("| Amplicon | Role | Product (bp) | Forward primer (5'→3') | Tm F | "
+                      "Reverse primer (5'→3') | Tm R | Notes |")
+            md.append("|----------|------|--------------|------------------------|------|"
+                      "------------------------|------|-------|")
+            for a in screening.amplicons:
+                notes = "; ".join(a.issues + a.warnings) or "—"
+                md.append(f"| {a.name} | {a.role} | {a.product_size} | `{a.forward.sequence}` | "
+                          f"{a.forward.tm} | `{a.reverse.sequence}` | {a.reverse.tm} | {notes} |")
+            md.append("")
+            md.append("**Targets:**\n")
+            for a in screening.amplicons:
+                md.append(f"- **{a.name}** ({a.role}): {a.target}")
+            md.append("")
+            if screening.max_gap_bp:
+                a0, b0 = screening.max_gap_span
+                md.append(f"**Interior coverage:** the longest stretch of the BGC without an interior "
+                          f"amplicon is {screening.max_gap_bp / 1000:.1f} kb ({a0 / 1000:.1f}-"
+                          f"{b0 / 1000:.1f} kb from the left end). Products differ by at least 150 bp.\n")
+            md.append("**Expected result:** correct clone = all bands above; empty vector = "
+                      "no band in any lane except vector-only controls; partial insert = junction "
+                      "bands present but one or more interior bands missing. Confirm positive "
+                      "clones by sequencing across both junctions (the junction primers can be "
+                      "used for this).\n")
+        if screening.failed:
+            md.append("**Could not be designed:**\n")
+            md.extend(f"- {f}" for f in screening.failed)
+            md.append("")
+        if screening.notes:
+            md.append("**Notes:**\n")
+            md.extend(f"- {n}" for n in screening.notes)
+            md.append("")
+        if screening.amplicons:
+            export_screening(screening, os.path.join(output_dir, "screening_primers.csv"))
+            md.append("**Screening primer CSV exported to:** `screening_primers.csv`\n")
 
     # Section 7: Visualization
     md.append("## 7. BGC Schematic Map\n")

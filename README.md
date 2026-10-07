@@ -115,6 +115,16 @@ Options:
                        sgRNA specificity (much faster; recommended unless you
                        need BLAST-grade off-target resolution)
   --auto-select        Auto-select top-ranked sgRNA (default)
+  --mode               Cas9 delivery: in-vitro (default) or in-vivo (see below)
+  --yeast-genome PATH  S. cerevisiae genome FASTA for the host off-target check (in-vivo)
+  --specificity-model  sgRNA off-target model: mit (default) or legacy
+  --n-pairs            Best guide pairs for which homology arms are evaluated (default: 5)
+  --screening/--no-screening  Colony-PCR screening primers on the final construct (default: on)
+  --marker-keyword TEXT  CDS annotation text selecting the marker gene (repeatable, priority order)
+  --marker-gene TAG    Pin the marker gene by locus_tag/gene/protein_id (fails if not found)
+  --screening-spaced   Integrity amplicons spread along the BGC (default: 2)
+  --absolute-arm-gc    Fixed arm GC limits (65%/75%) instead of limits relative to the fragment GC
+  --allow-internal-cuts  Keep sgRNAs that also cut inside the BGC (reported as warnings)
   --verbose            Verbose output
 ```
 
@@ -190,6 +200,34 @@ The `run` command in `cli.py` performs exactly this sequence and writes
 `report.md`, `report.html`, `cluster_map.svg`, and `primers.csv` into
 `--output`. Use the CLI unless you need to inject custom logic between
 steps (e.g. restricting sgRNAs to a curated list).
+
+## Cas9 delivery mode and cut-site safety
+
+`--mode in-vitro` (default) models the classic workflow: high-molecular-weight genomic DNA is digested with Cas9/sgRNA before transformation, so the capture vector and the yeast genome never see Cas9. sgRNAs are T7-transcribed (a 5' G is recommended; the report notes guides lacking it) and poly-T runs are not penalised.
+
+`--mode in-vivo` models Cas9 expressed in yeast: poly-T runs (Pol III terminator) are penalised, and the vector is scanned for cut sites; pass `--yeast-genome` to also scan the host genome (otherwise the report warns that it was not evaluated).
+
+In both modes every guide is scanned for additional cut sites inside the fragment that will be captured (PAM-aware, seed-weighted: NGG with a perfect 12-nt seed and at most `--max-mismatches` mismatches is high confidence; NAG/NGA PAMs or a single seed mismatch are medium). Guides with a high-confidence site inside the BGC are discarded, and the left/right pair is the best-ranked combination with no such site. This is a heuristic screen, not a cleavage-efficiency model.
+
+## Guide scoring and pair ranking
+
+Each candidate guide gets a genome-wide **specificity score (0–100)** in the style of the MIT server (Hsu et al. 2013): every PAM-adjacent near-match in the genome is scored by where its mismatches fall (PAM-proximal seed mismatches abolish cutting; PAM-distal ones are tolerated), and the hits are combined as `100 / (1 + Σ hit scores)`. A guide with no other site scores 100; one perfect extra copy scores 50. NAG/NGA PAM sites count with a reduced weight. The positional weights were reproduced from the published model — verify them against the paper or CRISPOR before citing absolute scores. `--specificity-model legacy` restores the old plain count.
+
+The left and right guides are then ranked **as pairs** (they define one fragment): score = weakest guide's specificity − penalties for guide quality (mode-aware), extra flanking DNA, medium-confidence cut sites, and — for the `--n-pairs` best pairs — homology-arm problems (non-unique arms, structure, arms shifted inward so end bases of the BGC are not captured). Pairs with a high-confidence cut site inside the fragment are excluded. The report lists the ranking and the score breakdown of the pair used.
+
+Not modelled: on-target cleavage efficiency (e.g. Doench Rule Set 2). The score ranks specificity and practical design constraints only.
+
+## Colony-PCR screening primers
+
+After TAR cloning most yeast colonies carry the empty vector or a partial insert, so the pipeline designs a screening panel on the *assembled construct* (section 6.1 of the report, `screening_primers.csv`):
+
+- **Junction amplicons (JL, JR):** one primer in the vector backbone and one inside the BGC fragment, so the band appears only when the vector is joined to that BGC end. The empty re-circularised vector gives no band.
+- **Marker gene (MK):** an amplicon inside a core biosynthetic gene. The gene is found in the GenBank annotation of the BGC (`--genbank`) by searching CDS product/gene/`gene_functions`/`sec_met_domain`/note text for `ketoacyl-synt` (the antiSMASH KS domain tag), `ketosynthase`, `chain length factor`, `ketoacyl synthase`, `polyketide synthase` and finally the antiSMASH core-gene label `biosynthetic (rule-based-clusters)`, in that priority order; matching ignores case, hyphens, underscores and extra spaces. A bare `t2pks` is deliberately not a default: antiSMASH writes `biosynthetic-additional (t2pks) KR/OXY/MET/...` on the *tailoring* genes. The report names the chosen CDS, quotes the annotation text that matched and warns when the keyword matched several CDSs (the one nearest the BGC centre is used): check it is the gene you want, or narrow it with `--marker-keyword` (primary-metabolism FabF-like synthases can match "ketoacyl synthase"). When a keyword matches several CDSs the report lists the other candidates; to choose one yourself use `--marker-gene LOCUS_TAG` (also matches `gene` and `protein_id`, case-insensitive; the run stops with the list of CDSs in the annotation if the name is not found). Without a match or without annotation, spaced amplicons are used instead.
+- **Integrity amplicons (IN1…):** placed along the BGC so that the longest stretch without an interior amplicon is as short as possible, counting the marker gene as covered; the report gives that longest stretch and notes it when it exceeds 12 kb (raise `--screening-spaced` for denser coverage).
+
+Product sizes are assigned from slots 100 bp wide and 150 bp apart (300–400, 550–650, 800–900 bp, …), so any two products differ by at least 150 bp and the panel can be read from one gel. Pairs come from primer3 (Tm 58–62 °C by default, same conditions as the other primers) and are checked by an in-silico PCR on the construct (the intended product must be the only one for that pair), against an optional host genome (`--yeast-genome`, one primer-site and product check) and for cross-dimers with the primers already chosen. Cross-pair products near the intended sizes are reported if all primers are put in one tube. The specificity checks use a simple model (exact 3' 10-mer, at most 3 mismatches), not a thermodynamic one; confirm by sequencing across both junctions with the junction primers.
+
+Homology-arm GC limits are now relative to the fragment's own GC: the absolute limits (65% ideal, 75% warning) are the floor, and for a high-GC fragment they become GC + 5 and GC + 10 points (a ~72% GC *Streptomyces* fragment: 77% and 82%). Use `--absolute-arm-gc` for the old behaviour.
 
 ## Output Files
 

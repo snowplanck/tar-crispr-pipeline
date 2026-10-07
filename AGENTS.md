@@ -34,6 +34,10 @@ python -m tar_crispr.cli run --bgc test_data/synthetic_bgc.fasta --vector test_d
 | `config.py` | — | Dataclasses: PipelineConfig, ClusterInfo, PAMCandidate, HomologyArm, TailedPrimer, AssemblyResult |
 | `sequence_io.py` | 1 | FASTA/GenBank parsing, sequence validation, cluster coordinate extraction |
 | `pam_finder.py` | 2 | PAM scanning, sgRNA scoring/ranking, specificity (BLAST or k-mer fallback) |
+| `guide_scoring.py` | 2 | Genome-wide, position-weighted (MIT/Hsu-style) sgRNA specificity score |
+| `pair_ranking.py` | 2–4 | Joint left/right guide-pair ranking; lazy homology-arm evaluation with best-first bound |
+| `screening.py` | 6b | Colony-PCR screening primers on the assembled construct (junctions, marker gene, integrity), in-silico PCR checks |
+| `cut_specificity.py` | 2–3 | Cas9 cut-site index (seed-keyed), internal/vector/yeast cut checks per mode, valid-pair selection |
 | `fragment_ends.py` | 3 | Cas9 blunt-cut position calculation, fragment extraction |
 | `homology_arms.py` | 4 | Arm extraction, validation (GC, uniqueness, secondary structure, RE sites), shifting |
 | `primer_design.py` | 5 | Tailed primer construction, primer3 optimization (Tm, hairpin, dimer, GC clamp) |
@@ -56,6 +60,10 @@ python -m tar_crispr.cli run --bgc test_data/synthetic_bgc.fasta --vector test_d
 | `tests/conftest.py` | Shared fixtures (synthetic sequences, temp file creators) |
 | `tests/test_sequence_io.py` | FASTA/GenBank parsing, validation, cluster extraction |
 | `tests/test_pam_finder.py` | PAM detection, GC calc, specificity, ranking, sgRNA design |
+| `tests/test_guide_scoring.py` | MIT-style hit score, genome scan, specificity annotation, ranking integration |
+| `tests/test_pair_ranking.py` | Pair scoring (weakest link, flank, mode), exclusion, arm stage, lazy evaluation |
+| `tests/test_screening.py` | In-silico PCR, junction/marker/integrity design, host and second-site checks, relative arm GC, CLI |
+| `tests/test_cut_specificity.py` | Cut-site index/classification, in-vitro vs in-vivo modes, pair selection, coordinate regressions, CLI E2E |
 | `tests/test_fragment_ends.py` | Cut position calculation, fragment extraction |
 | `tests/test_homology_arms.py` | Arm extraction, GC validation, uniqueness, secondary structure, shifting |
 | `tests/test_primer_design.py` | Tm, GC, hairpin, dimer, tailed primer construction, CSV export |

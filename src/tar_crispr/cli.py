@@ -18,6 +18,9 @@ from tar_crispr.sequence_io import (
 )
 from tar_crispr.pam_finder import design_sgRNAs, find_pam_sites, rank_sgRNAs
 from tar_crispr.fragment_ends import extract_fragment
+from tar_crispr.cut_specificity import build_index_from_fasta
+from tar_crispr.pair_ranking import rank_pairs, best_pair
+from tar_crispr.screening import design_screening
 from tar_crispr.homology_arms import design_homology_arms
 from tar_crispr.primer_design import design_tailed_primers
 from tar_crispr.assembly_sim import simulate_pydna_assembly
@@ -59,10 +62,52 @@ def run(
     avoid_enzymes: Optional[List[str]] = typer.Option(None, "--avoid-enzyme", help="Restriction enzymes to avoid in arms"),
     force_fallback: bool = typer.Option(False, "--no-blast", help="Force k-mer fallback instead of BLAST"),
     auto_select: bool = typer.Option(True, "--auto-select/--manual-select", help="Auto-select top-ranked sgRNA per end"),
+    mode: str = typer.Option("in-vitro", "--mode",
+                             help="Cas9 delivery: 'in-vitro' (RNP digests genomic DNA before "
+                                  "transformation) or 'in-vivo' (Cas9 expressed in yeast; also "
+                                  "checks the vector and the yeast genome for cut sites)"),
+    yeast_genome: Optional[str] = typer.Option(None, "--yeast-genome",
+                                               help="S. cerevisiae genome FASTA for off-target cut check (in-vivo mode)"),
+    specificity_model: str = typer.Option("mit", "--specificity-model",
+                                           help="sgRNA off-target model: 'mit' (genome-wide, position-weighted "
+                                                "score, default) or 'legacy' (plain count of look-alike sites)"),
+    screening: bool = typer.Option(True, "--screening/--no-screening",
+                                   help="Design colony-PCR screening primers (junctions, marker gene, "
+                                        "integrity amplicons) on the assembled construct"),
+    marker_keywords: Optional[List[str]] = typer.Option(
+        None, "--marker-keyword",
+        help="Text searched in CDS annotations to pick the marker gene (repeatable, in priority "
+             "order; default: type II PKS KS/CLF terms). Needs a GenBank BGC (--genbank)"),
+    marker_gene: Optional[str] = typer.Option(
+        None, "--marker-gene",
+        help="Pin the marker gene by locus_tag / gene / protein_id (case-insensitive) instead of "
+             "searching keywords. Needs a GenBank BGC (--genbank); fails if the gene is not found"),
+    screening_spaced: int = typer.Option(2, "--screening-spaced",
+                                         help="Integrity amplicons spread along the BGC"),
+    absolute_arm_gc: bool = typer.Option(False, "--absolute-arm-gc",
+                                         help="Use the fixed arm GC limits (65%/75%) instead of limits "
+                                              "relative to the fragment's GC"),
+    n_pairs: int = typer.Option(5, "--n-pairs",
+                                help="Minimum number of guide pairs whose homology arms are evaluated (more are "
+                                     "evaluated if needed to prove the best pair)"),
+    allow_internal_cuts: bool = typer.Option(False, "--allow-internal-cuts",
+                                             help="Keep sgRNAs that also cut inside the BGC (reported as warnings)"),
     verbose: bool = typer.Option(False, "--verbose", "-V", help="Verbose output"),
 ):
     """Run the full TAR-CRISPR pipeline end-to-end."""
+    if mode not in ("in-vitro", "in-vivo"):
+        sys.exit(f"ERROR: --mode must be 'in-vitro' or 'in-vivo', got {mode!r}")
+    if specificity_model not in ("mit", "legacy"):
+        sys.exit(f"ERROR: --specificity-model must be 'mit' or 'legacy', got {specificity_model!r}")
     config = PipelineConfig(
+        mode=mode,
+        specificity_model=specificity_model,
+        n_pairs=max(1, n_pairs),
+        relative_arm_gc=not absolute_arm_gc,
+        screening=screening,
+        screening_n_spaced=max(0, screening_spaced),
+        screening_marker_gene=marker_gene,
+        exclude_internal_cuts=not allow_internal_cuts,
         pam_window=pam_window,
         top_n_sgRNAs=top_n,
         homology_arm_length=arm_length,
@@ -201,9 +246,15 @@ def run(
     # Step 2: sgRNA design
     _log("Step 2: Designing sgRNAs...", verbose)
     genome_seq = str(genome_record.seq) if genome_record else str(bgc_record.seq)
+    _log(f"Cas9 mode: {config.mode}", verbose)
+    rejected: dict = {}
     sgRNAs = design_sgRNAs(
-        cluster_seq, upstream, downstream, genome_seq, config
+        cluster_seq, upstream, downstream, genome_seq, config,
+        upstream_start=cluster.start - len(upstream), rejected_out=rejected,
     )
+    n_rej = sum(len(v) for v in rejected.values())
+    if n_rej:
+        _log(f"Rejected {n_rej} sgRNA candidate(s) that would also cut inside the BGC", verbose)
     _log(f"Found {len(sgRNAs['left'])} left, {len(sgRNAs['right'])} right candidates", verbose)
 
     # Fail early if either side has no sgRNA. Without cuts at both
@@ -226,18 +277,69 @@ def run(
                 "(end=genome_length), so there is no downstream flank. "
                 "Trim the cluster or extend the genome."
             )
+        if n_rej:
+            hint += (
+                f"\n  Hint: {n_rej} candidate(s) were rejected because they would also "
+                "cut inside the BGC. Widen --pam-window or use --allow-internal-cuts."
+            )
         sys.exit(
             f"ERROR: No sgRNA candidates found at the {sides} boundary. "
             f"Cannot excise a fragment.{hint}"
         )
 
-    # Select sgRNAs
-    if auto_select and sgRNAs["left"] and sgRNAs["right"]:
-        selected = {"left": sgRNAs["left"][0], "right": sgRNAs["right"][0]}
-        _log(f"Auto-selected left: {selected['left'].protospacer}", verbose)
-        _log(f"Auto-selected right: {selected['right'].protospacer}", verbose)
+    # Select sgRNAs and check the pair for unwanted cleavage sites
+    vec_for_check = str(vector_record.seq).upper()
+    yeast_index = None
+    if config.mode == "in-vivo" and yeast_genome:
+        _log(f"Indexing yeast genome for cut-site check: {yeast_genome}", verbose)
+        yeast_index = build_index_from_fasta(
+            yeast_genome, config.protospacer_length, config.seed_length)
+
+    _log("Ranking guide pairs (specificity, cut-site safety, flanks, homology arms)...", verbose)
+    pairs = rank_pairs(sgRNAs, genome_seq, cluster.start, cluster.end, config,
+                       vec_for_check, yeast_index)
+    top = best_pair(pairs)
+    if not pairs:
+        sys.exit("ERROR: no left/right sgRNA pair flanks the cluster. "
+                 "Widen --pam-window or raise --top-n.")
+
+    if auto_select:
+        if top is None:
+            details = "\n  - ".join(pairs[0].cut_report.hard_issues)
+            if not allow_internal_cuts:
+                sys.exit(
+                    f"ERROR: none of the {len(pairs)} sgRNA pair(s) is free of unwanted "
+                    f"Cas9 cut sites (mode: {config.mode}). Best-ranked pair:\n  - {details}\n"
+                    "  Widen --pam-window / raise --top-n, or use --allow-internal-cuts "
+                    "to proceed anyway (issues are kept as warnings in the report).")
+            top = pairs[0]
+            _log("WARNING: proceeding with the top-ranked pair despite cut-site issues", verbose)
+        chosen = top
     else:
-        selected = _select_sgRNAs_interactive(sgRNAs, verbose)
+        manual = _select_sgRNAs_interactive(sgRNAs, verbose)
+        chosen = next((p for p in pairs
+                       if p.left.cut_position == manual["left"].cut_position
+                       and p.right.cut_position == manual["right"].cut_position), None)
+        if chosen is None:
+            sys.exit("ERROR: the selected guides do not form a valid pair around the cluster.")
+        if chosen.excluded and not allow_internal_cuts:
+            sys.exit("ERROR: the selected pair has unwanted Cas9 cut sites:\n  - "
+                     + "\n  - ".join(chosen.cut_report.hard_issues)
+                     + "\n  Use --allow-internal-cuts to override.")
+    selected = {"left": chosen.left, "right": chosen.right}
+    cut_report = chosen.cut_report
+    _log(f"Selected pair #{chosen.rank}: score {chosen.score:.1f}, "
+         f"min specificity {chosen.specificity}, fragment {chosen.fragment_length} bp", verbose)
+    _log(f"Auto-selected left: {selected['left'].protospacer}", verbose)
+    _log(f"Auto-selected right: {selected['right'].protospacer}", verbose)
+    for w in cut_report.warnings:
+        _log(f"WARNING: {w}", verbose)
+    for msg in cut_report.hard_issues:
+        _log(f"WARNING (overridden): {msg}", verbose)
+    for g in (chosen.left, chosen.right):
+        if g.specificity_score is not None and g.specificity_score < config.min_specificity:
+            _log(f"WARNING: guide {g.protospacer} has specificity "
+                 f"{g.specificity_score} (< {config.min_specificity})", verbose)
 
     # Step 3: Extract fragment
     _log("Step 3: Extracting Cas9 fragment...", verbose)
@@ -288,6 +390,40 @@ def run(
     _log(f"Assembly {'passed' if assembly_result.success else 'FAILED'}: "
          f"{assembly_result.final_size} bp, circular={assembly_result.circular}", verbose)
 
+    # Step 6b: colony-PCR screening primers on the assembled construct
+    screening_design = None
+    if config.screening:
+        if marker_keywords:
+            config.screening_marker_keywords = list(marker_keywords)
+        if not assembly_result.final_sequence:
+            _log("WARNING: no assembled construct; screening primers skipped", verbose)
+        else:
+            _log("Step 6b: Designing colony-PCR screening primers...", verbose)
+            host_seq = None
+            if yeast_genome:
+                from Bio import SeqIO
+                host_seq = "".join(str(r.seq) for r in SeqIO.parse(yeast_genome, "fasta"))
+            try:
+                screening_design = design_screening(
+                    assembly_result.final_sequence, vector_cut_left, len(fragment.sequence),
+                    fragment_seq=fragment.sequence, bgc_record=bgc_record,
+                    config=config, host_seq=host_seq)
+            except ValueError as e:
+                sys.exit(f"ERROR: {e}")
+            if screening_design.marker:
+                m = screening_design.marker
+                _log(f"Marker gene: {m['name']} ({m['product'] or m['keyword']}), matched keyword "
+                     f"'{m['keyword']}'", verbose)
+            if screening_design.max_gap_bp:
+                a0, b0 = screening_design.max_gap_span
+                _log(f"Interior coverage: longest stretch without an amplicon "
+                     f"{screening_design.max_gap_bp / 1000:.1f} kb ({a0 / 1000:.1f}-{b0 / 1000:.1f} kb)",
+                     verbose)
+            _log(f"Screening panel: {len(screening_design.amplicons)} amplicon(s), "
+                 f"sizes {[a.product_size for a in screening_design.amplicons]}", verbose)
+            for f in screening_design.failed:
+                _log(f"WARNING: screening amplicon not designed: {f}", verbose)
+
     # Step 7: Generate report
     _log("Step 7: Generating report...", verbose)
     Path(output).mkdir(parents=True, exist_ok=True)
@@ -302,6 +438,9 @@ def run(
         genome_stats=bgc_stats,
         output_dir=output,
         selected_sgRNAs=selected,
+        cut_safety=cut_report,
+        pair_ranking=pairs,
+        screening=screening_design,
     )
 
     # Optional: render a circular map of the final construct.
@@ -414,8 +553,11 @@ def sgrna_command(
     pam_window: int = typer.Option(500, "--pam-window", help="Flanking window"),
     top_n: int = typer.Option(5, "--top-n", help="Top N candidates"),
     max_mismatches: int = typer.Option(3, "--max-mismatches", help="Max mismatches"),
+    mode: str = typer.Option("in-vitro", "--mode", help="'in-vitro' or 'in-vivo'"),
 ):
     """Quick sgRNA design for a given genomic region."""
+    if mode not in ("in-vitro", "in-vivo"):
+        sys.exit(f"ERROR: --mode must be 'in-vitro' or 'in-vivo', got {mode!r}")
     record = read_sequence(genome)
     cluster = extract_cluster_bounds(record, start, end)
     upstream, cluster_seq, downstream = get_flanking_sequence(record, cluster, pam_window)
@@ -423,20 +565,24 @@ def sgrna_command(
         pam_window=pam_window,
         top_n_sgRNAs=top_n,
         max_mismatches=max_mismatches,
+        mode=mode,
     )
     config = check_external_tools(config)
     genome_seq = str(record.seq)
-    sgRNAs = design_sgRNAs(cluster_seq, upstream, downstream, genome_seq, config)
+    sgRNAs = design_sgRNAs(cluster_seq, upstream, downstream, genome_seq, config,
+                           upstream_start=cluster.start - len(upstream))
 
     print(f"\n=== Left (upstream) sgRNAs ===")
     for i, sg in enumerate(sgRNAs["left"]):
         print(f"  {i+1}. {sg.protospacer} | {sg.strand} strand | "
-              f"cut={sg.cut_position} | GC={sg.gc_percent}% | Poly-T={'Y' if sg.polyt_flag else 'N'}")
+              f"cut={sg.cut_position} | GC={sg.gc_percent}% | Poly-T={'Y' if sg.polyt_flag else 'N'} | "
+              f"Spec={sg.specificity_score if sg.specificity_score is not None else '-'}")
 
     print(f"\n=== Right (downstream) sgRNAs ===")
     for i, sg in enumerate(sgRNAs["right"]):
         print(f"  {i+1}. {sg.protospacer} | {sg.strand} strand | "
-              f"cut={sg.cut_position} | GC={sg.gc_percent}% | Poly-T={'Y' if sg.polyt_flag else 'N'}")
+              f"cut={sg.cut_position} | GC={sg.gc_percent}% | Poly-T={'Y' if sg.polyt_flag else 'N'} | "
+              f"Spec={sg.specificity_score if sg.specificity_score is not None else '-'}")
 
 
 if __name__ == "__main__":
